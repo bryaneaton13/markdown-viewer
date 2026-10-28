@@ -1,42 +1,81 @@
-# Markdown Viewer
+<p align="center">
+  <img src="assets/logo.png" alt="Markdown Viewer logo" width="96">
+</p>
 
-A local, read-only macOS Markdown reader built with **GPUI Kit 0.7.1**, plus a **Finder Quick Look preview extension**. The application setup and offscreen validation workflow follow the patterns in `bible-reader-desktop`.
+<h1 align="center">Markdown Viewer</h1>
 
-## Run it
+<p align="center">
+  A fast, native, read-only Markdown reader for macOS, with a Finder Quick Look extension.
+</p>
 
-Requires macOS 13+, Rust (the pinned toolchain installs via rustup), and Xcode/Apple command-line tooling. Building the Finder extension uses the macOS SDK and Swift compiler.
+<p align="center">
+  <a href="https://github.com/bryaneaton13/markdown-viewer/actions/workflows/ci.yml"><img src="https://github.com/bryaneaton13/markdown-viewer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/macOS-13%2B-lightgrey.svg" alt="macOS 13+">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/light.png" alt="Markdown Viewer in light mode with a folder tree and a rendered document" width="800">
+</p>
+
+Open a folder of Markdown, jump between files, and read them rendered. Nothing is editable, so you can't change a file by accident. It is built in Rust with [GPUI Kit](https://github.com/longbridge/gpui-kit), has no web view or Electron runtime, and works fully offline.
+
+> **Status: early prototype (v0.1).** It works and is tested, but it is unsigned and has no packaged releases yet. See [Limitations](#limitations).
+
+## Features
+
+- Selectable, natively rendered Markdown: headings, emphasis, lists, tables, task lists, code, links, footnotes and local images.
+- Folder tree and filtered **Quick Open** (⌘P) for `.md` and `.markdown` files.
+- Find against the *rendered* text, with match highlighting and next/previous.
+- Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
+- Back/forward history, light/dark mode, adjustable text size, and automatic reload when a file changes on disk.
+- Finder and Dock "open with" support. Preferences persist between launches.
+- **Finder Quick Look**: press Space on a Markdown file for an offline rendered preview.
+
+<p align="center">
+  <img src="docs/screenshots/dark.png" alt="Dark mode with find highlighting" width="800">
+</p>
+
+## Install
+
+There are no prebuilt releases yet, so build from source. You need:
+
+- macOS 13 or later (Apple Silicon or Intel)
+- [Rust](https://rustup.rs). The pinned toolchain in `rust-toolchain.toml` installs automatically.
+- Xcode or the Xcode Command Line Tools (`xcode-select --install`), which provide the Swift compiler used for the Quick Look extension
 
 ```sh
-cargo run -- fixtures/Welcome.md
-cargo run -- /path/to/your/notes
-scripts/bundle.sh
-open "dist/Markdown Viewer.app" --args "$PWD/fixtures/Welcome.md"
-```
-
-For a local installation with Finder registration:
-
-```sh
-scripts/bundle.sh --install
+git clone https://github.com/bryaneaton13/markdown-viewer.git
+cd markdown-viewer
+scripts/bundle.sh --release --install
 open "$HOME/Applications/Markdown Viewer.app"
 ```
 
-The default bundle is a development build. Use `scripts/bundle.sh --release --install` for an optimized build. Bundles are ad-hoc signed for local development, not notarized distribution builds.
+This builds the app, signs it ad hoc, copies it to `~/Applications`, and registers the Quick Look extension with Finder. Because the build is ad-hoc signed and not notarized, it only runs on the machine that built it.
 
-## Included
+### Make it your default `.md` app
 
-- Native, selectable Markdown: headings, emphasis, lists, tables, task lists, code, links, footnotes and local images.
-- Folder tree and filtered Quick Open; only `.md` and `.markdown` files.
-- Sidebar keyboard navigation and show/hide, back/forward file history.
-- Find against **rendered text**, match highlighting and next/previous navigation.
-- Read-only source mode; YAML frontmatter with a Properties disclosure and diagnostics.
-- Light/dark mode, adjustable text size, automatic reload on external changes.
-- Native file/folder pickers and Finder/Dock document-open events.
-- Persisted last file/folder, sidebar visibility, text size and theme.
-- Offline Finder Quick Look extension with shared frontmatter/parser logic.
+Select a `.md` file in Finder, choose **Get Info → Open with → Markdown Viewer → Change All**. Repeat for `.markdown` if needed. The installer never changes your default app for you.
 
-This prototype shows **one document at a time**. Tabs, custom themes, editing, Mermaid rendering, multi-root workspaces and full session/scroll restoration are not implemented. Mermaid fences remain code. Files must be UTF-8 and at most 8 MiB. Folder discovery respects ignore rules, hides hidden files, does not follow directory symlinks, and is bounded to 20,000 Markdown files / 32 levels. Remote images are not fetched.
+### Enable Quick Look
 
-## Keyboard
+Select a Markdown file in Finder and press Space. If the preview is plain text, enable **Markdown Preview** in **System Settings → General → Login Items & Extensions → Quick Look**. Other Markdown Quick Look plugins can compete for the same file type; to check that this one is registered:
+
+```sh
+pluginkit -m -A -D -i com.bryaneaton.MarkdownViewer.Preview   # "+" means enabled
+```
+
+## Usage
+
+```sh
+cargo run -- fixtures/Welcome.md      # open a file
+cargo run -- /path/to/your/notes      # open a folder
+open -a "Markdown Viewer" notes.md    # after installing
+```
+
+### Keyboard shortcuts
+
+Press ⌘/ in the app for this list and the Finder setup notes.
 
 | Shortcut | Action |
 | --- | --- |
@@ -44,7 +83,7 @@ This prototype shows **one document at a time**. Tabs, custom themes, editing, M
 | ⌘P | Quick Open |
 | ⌘B or ⌃⌘S | Show/hide sidebar |
 | ⌘1 / ⌘2 | Focus tree / document |
-| ↑ ↓ ← → | Navigate focused folder tree |
+| ↑ ↓ ← → | Navigate the focused folder tree |
 | Enter / Space in tree | Open selection / focus reader |
 | ⌘F / ⌘G / ⇧⌘G | Find / next / previous match |
 | ⌘[ / ⌘] | Back / forward |
@@ -53,63 +92,47 @@ This prototype shows **one document at a time**. Tabs, custom themes, editing, M
 | ⇧⌘D | Toggle light/dark |
 | ⌘+ / ⌘− / ⌘0 | Text size |
 | ⌘R | Reload |
-| ⌘/ | Shortcuts and Finder setup |
 | ⌃⌘F | Full screen |
 | ⌘W / ⌘Q | Close window / quit |
 
-## Default app for `.md`
+The app keeps running after you close its window; quit with ⌘Q. Settings live in `~/Library/Application Support/Markdown Viewer/settings.json`.
 
-Install the app, then select a `.md` file in Finder → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary. The bundle registers a Markdown **Viewer**, but deliberately does not change your existing default application during installation.
+## Limitations
 
-Opening by application name also works after registration:
+- One document at a time: no tabs, editing, custom themes or multi-root workspaces.
+- Mermaid blocks render as code. Remote images are never fetched.
+- Files must be UTF-8 and at most 8 MiB.
+- Folder discovery respects ignore rules, skips hidden files, does not follow directory symlinks, and stops at 20,000 files or 32 levels deep.
+- Quick Look shows images as alt text (the sandbox only receives the selected file), omits raw HTML, and blocks scripts and network access.
+- Not notarized, so no downloadable builds yet.
 
-```sh
-open -a "Markdown Viewer" "$PWD/fixtures/Welcome.md"
-```
-
-## Finder Quick Look
-
-The bundle contains `Contents/PlugIns/Markdown Preview.appex`, a sandboxed, data-based `QLPreviewProvider`. The provider links the same Rust core as the application and returns offline HTML to macOS. It does not spawn a renderer or need Node.
-
-After installation, enable **Markdown Preview** in **System Settings → General → Login Items & Extensions → Quick Look** if your macOS version requires it. Select a Markdown file in Finder and press **Space**. Other installed Markdown providers can compete for the same type; default-app selection and Quick Look provider selection are independent.
-
-Quick Look supports text, tables, code and frontmatter. Images use their alt text because the sandbox receives the selected file, not arbitrary neighboring files. Raw HTML is excluded, and the preview blocks scripts and network resources.
-
-```sh
-# Inspect provider registration (a + indicates enabled)
-pluginkit -m -A -D -i com.bryaneaton.MarkdownViewer.Preview
-# Exercise the system Quick Look host interactively
-qlmanage -p "$PWD/fixtures/Welcome.md"
-```
-
-## Validate and view
+## Development
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-scripts/check-quicklook.sh
-scripts/shot.sh reports/reader-light.png fixtures/Welcome.md properties
-scripts/shot.sh reports/reader-dark.png fixtures/Welcome.md dark,nosidebar,find:Markdown
-# All of the above, plus bundle checks:
-scripts/validate.sh
+scripts/validate.sh        # all of the above, plus bundle, Quick Look and screenshot checks
 ```
-
-`shot.sh` captures the real GPUI window using Metal `render_to_image`, not a web mockup. It isolates application settings via `MARKDOWN_VIEWER_STATE_DIR`; no screen-recording permission is needed. Available scripted states: `light`, `dark`, `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help` (comma-separated).
-
-Tests cover frontmatter edge cases, Unicode find offsets, links, HTML preview sanitization, unchanged source bytes, folder filtering, sidebar/focus shortcuts, rendered search and Quick Open keyboard navigation. `check-quicklook.sh` compiles and calls the **same Swift → Rust bridge** used by the extension and writes `reports/quicklook.html`; this validates rendering, not Finder's provider selection. Test Finder separately using the installed bundle.
-
-Use `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` for isolated live experiments. Normal preferences are in `~/Library/Application Support/Markdown Viewer/settings.json`. The app stays running after closing its window; use ⌘Q to quit.
-
-## Source map
 
 ```text
-crates/markdown-core/   parsing, metadata, links, find, safe HTML, Quick Look C ABI
+crates/markdown-core/   parsing, frontmatter, links, find, safe HTML, Quick Look C ABI
 crates/app/             GPUI application, reader, folder discovery, preferences
-native/QuickLook/       Swift preview provider + bridge smoke test
-assets/Info.plist       Markdown document type registration
-fixtures/              representative Markdown and local image
-scripts/               bundle/install, screenshots, validation
+native/QuickLook/       Swift Quick Look preview provider and bridge smoke test
+assets/                 Info.plist, app icon, logo
+fixtures/               sample Markdown and a local image for tests and screenshots
+scripts/                bundle/install, screenshots, validation
+docs/                   original research and design plan
 ```
 
-See [RESEARCH.md](RESEARCH.md) and [PLAN.md](PLAN.md) for the original research and broader design. Current implementation scope is described here.
+`scripts/shot.sh OUT.png FILE STATES` captures the real GPUI window with Metal `render_to_image`, with no screen-recording permission needed. `STATES` is a comma-separated list of `light`, `dark`, `browse` (open the file's parent folder in the sidebar), `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help`. Set `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` to keep experiments away from your real settings.
+
+`scripts/check-quicklook.sh` compiles and calls the same Swift-to-Rust bridge the extension uses and writes `reports/quicklook.html`. It checks rendering, not Finder's choice of preview provider, so test that with an installed bundle.
+
+## Contributing
+
+Issues and pull requests are welcome. Before opening a PR, run `scripts/validate.sh` (CI runs the same checks) and add a test for behavior changes. Background and design intent are in [docs/RESEARCH.md](docs/RESEARCH.md) and [docs/PLAN.md](docs/PLAN.md).
+
+## License
+
+[MIT](LICENSE). Built on [GPUI Kit](https://github.com/longbridge/gpui-kit) (Apache-2.0).

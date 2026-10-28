@@ -55,6 +55,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-1", FocusSidebar, None),
         KeyBinding::new("cmd-2", FocusReader, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
+        KeyBinding::new("cmd-k", QuickOpen, None),
         KeyBinding::new("cmd-shift-l", Outline, None),
         KeyBinding::new("cmd-f", Find, None),
         KeyBinding::new("cmd-g", NextMatch, None),

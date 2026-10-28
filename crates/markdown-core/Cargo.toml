@@ -3,6 +3,10 @@ name = "markdown-core"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Markdown parsing, frontmatter, find and safe-HTML core shared by the app and Quick Look extension"
 
 [lib]
 crate-type = ["rlib", "staticlib"]

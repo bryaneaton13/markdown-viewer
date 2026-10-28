@@ -3,6 +3,10 @@ name = "markdown-viewer"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A read-only, native macOS Markdown reader built with GPUI"
 
 [dependencies]
 markdown-core = { path = "../markdown-core" }

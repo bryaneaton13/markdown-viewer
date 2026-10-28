@@ -20,7 +20,7 @@ use std::{collections::HashSet, ops::Range, path::PathBuf, time::Duration};
 const TOOLBAR_HEIGHT: f32 = 44.;
 const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
 const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Browse a folder\n- **⌘P** — Jump to a file\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
-const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / folder |\n| ⌘P | Quick Open |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| Escape | Dismiss picker, find, or help |\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Prototype scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels. One document at a time with back/forward history. Mermaid stays visible as code. Remote images are not fetched.\n";
+const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / folder |\n| ⌘P / ⌘K | Quick Open |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| Escape | Dismiss picker, find, or help |\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Prototype scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels. One document at a time with back/forward history. Mermaid stays visible as code. Remote images are not fetched.\n";
 
 pub struct Reader {
     prefs: Preferences,
@@ -612,9 +612,11 @@ impl Reader {
                     .child("WORKSPACE"),
             )
             .child(
-                div().px_3().pb_3().child(
+                div().px_1().pb_3().child(
                     Button::new("open-folder")
                         .ghost()
+                        .w_full()
+                        .justify_start()
                         .icon(IconName::FolderOpen)
                         .label(
                             self.root
@@ -761,8 +763,16 @@ impl Reader {
                 })
                 .collect()
         };
+        let empty_msg = if outline {
+            "No headings in this document."
+        } else if self.root.is_none() {
+            "Open a folder (⇧⌘O) to search its Markdown files."
+        } else {
+            "No matching files."
+        };
         let weak = cx.entity().downgrade();
         let cancel = weak.clone();
+        let dismiss = weak.clone();
         div()
             .absolute()
             .inset_0()
@@ -770,14 +780,16 @@ impl Reader {
             .justify_center()
             .pt(px(80.))
             .bg(rgba(0x00000035))
+            .on_mouse_down(MouseButton::Left, move |_, w, cx| {
+                let _ = dismiss.update(cx, |v, cx| v.close_overlay(w, cx));
+            })
             .child(
                 div()
                     .w(px(570.))
-                    .h(px(420.))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .rounded_xl()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
+                    .overflow_hidden()
                     .shadow_lg()
                     .child(
                         Command::new(&self.palette)
@@ -786,7 +798,15 @@ impl Reader {
                             } else {
                                 "Find a Markdown file…"
                             })
-                            .max_h(px(360.))
+                            .max_h(px(320.))
+                            .empty(move |_, _, cx| {
+                                div()
+                                    .py_6()
+                                    .text_center()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(empty_msg)
+                            })
                             .group(
                                 CommandGroup::new()
                                     .label(if outline { "HEADINGS" } else { "FILES" })
@@ -1077,11 +1097,15 @@ impl Render for Reader {
                                 |d| {
                                     d.child(
                                         div()
-                                            .px_5()
+                                            .px(px(20.))
                                             .pt_2()
+                                            .flex()
+                                            .flex_col()
+                                            .items_start()
                                             .child(
                                                 Button::new("properties")
                                                     .ghost()
+                                                    .justify_start()
                                                     .icon(if self.properties {
                                                         IconName::ChevronDown
                                                     } else {
@@ -1281,6 +1305,15 @@ mod tests {
         });
         interact(w, cx, |w, cx| w.press("enter", cx));
         assert_eq!(view.read_with(cx, |v, _| v.path.clone()), Some(second));
+        assert!(view.read_with(cx, |v, _| v.picker.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn cmd_k_opens_quick_open_and_escape_closes(cx: &mut TestAppContext) {
+        let (w, view) = open(cx);
+        interact(w, cx, |w, cx| w.press("cmd-k", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.picker), Some(false));
+        interact(w, cx, |w, cx| w.press("escape", cx));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
     }
 

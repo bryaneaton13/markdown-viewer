@@ -5,7 +5,7 @@ Research and build-versus-use rationale: [RESEARCH.md](RESEARCH.md).
 
 ## Implementation decision
 
-The user approved a custom GPUI prototype, with `bible-reader-desktop` as the setup/validation reference. The first implementation is read-only and Markdown-only. Finder Quick Look is promoted into this delivery; Mermaid remains code because it is not a trivial built-in Kit component. One-document navigation/history replaces tabs in the first prototype. See [README.md](README.md) for implemented behavior and repeatable validation commands; the sections below retain the broader design roadmap.
+The project is a custom GPUI prototype. The first implementation is read-only and Markdown-only. Finder Quick Look is promoted into this delivery; Mermaid remains code because it is not a trivial built-in Kit component. One-document navigation/history replaces tabs in the first prototype. See [README.md](../README.md) for implemented behavior and repeatable validation commands; the sections below retain the broader design roadmap.
 
 ## 1. Product decision
 
