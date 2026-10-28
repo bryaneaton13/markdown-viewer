@@ -20,7 +20,7 @@
 
 Open a folder of Markdown, jump between files, and read them rendered. Nothing is editable, so you can't change a file by accident. It is built in Rust with [GPUI Kit](https://github.com/longbridge/gpui-kit), has no web view or Electron runtime, and works fully offline.
 
-> **Status: early prototype (v0.1).** It works and is tested, but it is unsigned and has no packaged releases yet. See [Limitations](#limitations).
+> **Status: early release (v0.1).** It works and is tested, but the download is ad-hoc signed, not notarized. See [Limitations](#limitations).
 
 ## Features
 
@@ -38,7 +38,13 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 
 ## Install
 
-There are no prebuilt releases yet, so build from source. You need:
+### Download (Apple Silicon)
+
+Download the ZIP from [GitHub Releases](https://github.com/bryaneaton13/markdown-viewer/releases/latest), unzip it, and drag **Markdown Viewer.app** into Applications. The build is ad-hoc signed, not notarized, so if macOS blocks it, open **System Settings → Privacy & Security → Open Anyway**. Only approve a download you trust.
+
+### Build from source
+
+You need:
 
 - macOS 13 or later (Apple Silicon or Intel)
 - [Rust](https://rustup.rs). The pinned toolchain in `rust-toolchain.toml` installs automatically.
@@ -51,7 +57,7 @@ scripts/bundle.sh --release --install
 open "$HOME/Applications/Markdown Viewer.app"
 ```
 
-This builds the app, signs it ad hoc, copies it to `~/Applications`, and registers the Quick Look extension with Finder. Because the build is ad-hoc signed and not notarized, it only runs on the machine that built it.
+This builds the app, signs it ad hoc, copies it to `~/Applications`, and registers the Quick Look extension with Finder.
 
 ### Make it your default `.md` app
 
@@ -104,7 +110,7 @@ The app keeps running after you close its window; quit with ⌘Q. Settings live 
 - Files must be UTF-8 and at most 8 MiB.
 - Folder discovery respects ignore rules, skips hidden files, does not follow directory symlinks, and stops at 20,000 files or 32 levels deep.
 - Quick Look shows images as alt text (the sandbox only receives the selected file), omits raw HTML, and blocks scripts and network access.
-- Not notarized, so no downloadable builds yet.
+- Not notarized: downloads need **Open Anyway** on first launch, and the Quick Look extension may need enabling by hand.
 
 ## Development
 
@@ -121,7 +127,7 @@ crates/app/             GPUI application, reader, folder discovery, preferences
 native/QuickLook/       Swift Quick Look preview provider and bridge smoke test
 assets/                 Info.plist, app icon, logo
 fixtures/               sample Markdown and a local image for tests and screenshots
-scripts/                bundle/install, screenshots, validation
+scripts/                bundle/install, packaging, screenshots, validation
 docs/                   original research and design plan
 ```
 
@@ -132,6 +138,8 @@ docs/                   original research and design plan
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a PR, run `scripts/validate.sh` (CI runs the same checks) and add a test for behavior changes. Background and design intent are in [docs/RESEARCH.md](docs/RESEARCH.md) and [docs/PLAN.md](docs/PLAN.md).
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
