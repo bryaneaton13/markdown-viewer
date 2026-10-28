@@ -21,6 +21,7 @@ extension="$app/Contents/PlugIns/Markdown Preview.appex"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$extension/Contents/MacOS"
 cp "target/$profile/markdown-viewer" "$app/Contents/MacOS/"
 cp assets/Info.plist "$app/Contents/Info.plist"
+cp assets/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 cp native/QuickLook/Info.plist "$extension/Contents/Info.plist"
 arch=$(uname -m)
 xcrun swiftc -O -parse-as-library -module-name MarkdownPreview \

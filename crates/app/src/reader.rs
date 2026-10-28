@@ -17,6 +17,8 @@ use markdown_core::{Document, Link};
 use notify::Watcher;
 use std::{collections::HashSet, ops::Range, path::PathBuf, time::Duration};
 
+const TOOLBAR_HEIGHT: f32 = 44.;
+const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
 const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Browse a folder\n- **⌘P** — Jump to a file\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
 const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / folder |\n| ⌘P | Quick Open |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| Escape | Dismiss picker, find, or help |\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Prototype scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels. One document at a time with back/forward history. Mermaid stays visible as code. Remote images are not fetched.\n";
 
@@ -487,13 +489,21 @@ impl Reader {
         cx.notify();
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new().child(
+    fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        // 44px toolbar doubles as the title bar; traffic lights are centered in it (main.rs).
+        TitleBar::new()
+            .h(px(TOOLBAR_HEIGHT))
+            .bg(theme.background)
+            .border_color(theme.border)
+            .when(window.is_fullscreen(), |d| d.pl_2())
+            .child(
             div()
                 .flex()
                 .items_center()
                 .gap_1()
-                .size_full()
+                .w_full()
+                .pr_2()
                 .child(
                     Button::new("sidebar")
                         .ghost()
@@ -846,7 +856,7 @@ impl Reader {
 }
 
 impl Render for Reader {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
         let image_base = self.path.clone();
         let reader = TextView::new(&self.text)
@@ -972,7 +982,7 @@ impl Render for Reader {
                     }
                 }
             }))
-            .child(self.toolbar(cx))
+            .child(self.toolbar(window, cx))
             .child(
                 div()
                     .relative()
@@ -1104,6 +1114,17 @@ impl Render for Reader {
                                     )
                                 },
                             )
+                            .when(self.path.is_none() && !self.source && !self.help, |d| {
+                                d.child(
+                                    div().px(px(32.)).pt(px(24.)).child(
+                                        img(std::sync::Arc::new(Image::from_bytes(
+                                            ImageFormat::Png,
+                                            LOGO.to_vec(),
+                                        )))
+                                        .size(px(72.)),
+                                    ),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_1()

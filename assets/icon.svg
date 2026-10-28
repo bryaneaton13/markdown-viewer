@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B3A67"/>
+      <stop offset="1" stop-color="#141B34"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFB86B"/>
+      <stop offset="1" stop-color="#FF8A5B"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)"/>
+  <!-- page outline (rounded, as in the original mark) -->
+  <rect x="198" y="304" width="628" height="416" rx="64" fill="none" stroke="#F4F6FB" stroke-width="44"/>
+  <!-- M -->
+  <path d="M290 612 V412 L378 520 L466 412 V612" fill="none" stroke="#F4F6FB" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- down arrow, accent color -->
+  <path d="M658 412 V596 M588 530 L658 604 L728 530" fill="none" stroke="url(#accent)" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

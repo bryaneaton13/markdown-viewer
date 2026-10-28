@@ -2,3 +2,4 @@
 /dist/
 /reports/
 .DS_Store
+.omc/
