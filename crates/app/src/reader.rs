@@ -38,6 +38,7 @@ pub struct Reader {
     selected: usize,
     tree_scroll: UniformListScrollHandle,
     source: bool,
+    copied: bool,
     properties: bool,
     help: bool,
     find: bool,
@@ -119,6 +120,7 @@ impl Reader {
             selected: 0,
             tree_scroll: UniformListScrollHandle::new(),
             source: false,
+            copied: false,
             properties: false,
             help: false,
             find: false,
@@ -324,6 +326,23 @@ impl Reader {
             {
                 let _ = this.update(cx, |this, cx| this.open_path(path, cx));
             }
+        })
+        .detach();
+    }
+
+    fn copy_source(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = &self.document else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(doc.source_markdown()));
+        self.copied = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                v.copied = false;
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -546,7 +565,7 @@ impl Reader {
                         .ghost()
                         .icon(IconName::Search)
                         .label("Quick Open")
-                        .tooltip("Find a file · ⌘P")
+                        .tooltip("Find a file · ⌘P or ⌘K")
                         .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
                 )
                 .child(
@@ -556,6 +575,20 @@ impl Reader {
                         .tooltip("Heading outline · ⇧⌘L")
                         .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
                 )
+                .when(self.source && !self.help && self.document.is_some(), |d| {
+                    d.child(
+                        Button::new("copy-source")
+                            .ghost()
+                            .icon(if self.copied {
+                                IconName::Check
+                            } else {
+                                IconName::Copy
+                            })
+                            .label(if self.copied { "Copied" } else { "Copy" })
+                            .tooltip("Copy Markdown source")
+                            .on_click(cx.listener(|v, _, _, cx| v.copy_source(cx))),
+                    )
+                })
                 .child(
                     Button::new("source")
                         .ghost()
@@ -790,7 +823,7 @@ impl Reader {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .rounded_xl()
                     .overflow_hidden()
-                    .shadow_lg()
+                    .shadow_md()
                     .child(
                         Command::new(&self.palette)
                             .placeholder(if outline {
@@ -1306,6 +1339,23 @@ mod tests {
         interact(w, cx, |w, cx| w.press("enter", cx));
         assert_eq!(view.read_with(cx, |v, _| v.path.clone()), Some(second));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn copy_source_writes_markdown_to_clipboard(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("Doc.md");
+        std::fs::write(&file, "# Doc\n\nbody").unwrap();
+        let (_, view) = open(cx);
+        view.update(cx, |v, cx| v.load_file(file, true, cx));
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.source = true;
+            v.copy_source(cx);
+        });
+        assert!(view.read_with(cx, |v, _| v.copied));
+        let text = cx.read_from_clipboard().and_then(|c| c.text());
+        assert!(text.is_some_and(|t| t.contains("# Doc")));
     }
 
     #[gpui_kit::test]
