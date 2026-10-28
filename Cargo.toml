@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/markdown-core", "crates/app"]
+default-members = ["crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = "debuginfo"
