@@ -517,108 +517,108 @@ impl Reader {
             .border_color(theme.border)
             .when(window.is_fullscreen(), |d| d.pl_2())
             .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .w_full()
-                .pr_2()
-                .child(
-                    Button::new("sidebar")
-                        .ghost()
-                        .icon(IconName::PanelLeft)
-                        .tooltip("Toggle sidebar · ⌘B")
-                        .on_click(cx.listener(|v, _, w, cx| v.toggle_sidebar(w, cx))),
-                )
-                .child(
-                    Button::new("back")
-                        .ghost()
-                        .icon(IconName::ChevronLeft)
-                        .disabled(self.history_index == 0)
-                        .tooltip("Back · ⌘[")
-                        .on_click(cx.listener(|v, _, _, cx| v.navigate(true, cx))),
-                )
-                .child(
-                    Button::new("forward")
-                        .ghost()
-                        .icon(IconName::ChevronRight)
-                        .disabled(self.history_index + 1 >= self.history.len())
-                        .tooltip("Forward · ⌘]")
-                        .on_click(cx.listener(|v, _, _, cx| v.navigate(false, cx))),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .overflow_hidden()
-                        .child(
-                            self.path
-                                .as_ref()
-                                .and_then(|p| p.file_name())
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or("Markdown Viewer".into()),
-                        ),
-                )
-                .child(
-                    Button::new("quick-open")
-                        .ghost()
-                        .icon(IconName::Search)
-                        .label("Quick Open")
-                        .tooltip("Find a file · ⌘P or ⌘K")
-                        .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
-                )
-                .child(
-                    Button::new("outline")
-                        .ghost()
-                        .label("Outline")
-                        .tooltip("Heading outline · ⇧⌘L")
-                        .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
-                )
-                .when(self.source && !self.help && self.document.is_some(), |d| {
-                    d.child(
-                        Button::new("copy-source")
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .w_full()
+                    .pr_2()
+                    .child(
+                        Button::new("sidebar")
                             .ghost()
-                            .icon(if self.copied {
-                                IconName::Check
-                            } else {
-                                IconName::Copy
-                            })
-                            .label(if self.copied { "Copied" } else { "Copy" })
-                            .tooltip("Copy Markdown source")
-                            .on_click(cx.listener(|v, _, _, cx| v.copy_source(cx))),
+                            .icon(IconName::PanelLeft)
+                            .tooltip("Toggle sidebar · ⌘B")
+                            .on_click(cx.listener(|v, _, w, cx| v.toggle_sidebar(w, cx))),
                     )
-                })
-                .child(
-                    Button::new("source")
-                        .ghost()
-                        .label(if self.source { "Preview" } else { "Source" })
-                        .tooltip("Read-only source · ⇧⌘M")
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.source = !v.source;
-                            v.present(cx);
-                        })),
-                )
-                .child(
-                    Button::new("theme")
-                        .ghost()
-                        .icon(IconName::Sun)
-                        .tooltip("Toggle theme · ⇧⌘D")
-                        .on_click(
-                            cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(ToggleTheme), cx)),
-                        ),
-                )
-                .child(
-                    Button::new("help")
-                        .ghost()
-                        .icon(IconName::Info)
-                        .tooltip("Shortcuts & Finder setup · ⌘/")
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.help = !v.help;
-                            v.present(cx);
-                        })),
-                ),
-        )
+                    .child(
+                        Button::new("back")
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .disabled(self.history_index == 0)
+                            .tooltip("Back · ⌘[")
+                            .on_click(cx.listener(|v, _, _, cx| v.navigate(true, cx))),
+                    )
+                    .child(
+                        Button::new("forward")
+                            .ghost()
+                            .icon(IconName::ChevronRight)
+                            .disabled(self.history_index + 1 >= self.history.len())
+                            .tooltip("Forward · ⌘]")
+                            .on_click(cx.listener(|v, _, _, cx| v.navigate(false, cx))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .overflow_hidden()
+                            .child(
+                                self.path
+                                    .as_ref()
+                                    .and_then(|p| p.file_name())
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or("Markdown Viewer".into()),
+                            ),
+                    )
+                    .child(
+                        Button::new("quick-open")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .label("Quick Open")
+                            .tooltip("Find a file · ⌘P or ⌘K")
+                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
+                    )
+                    .child(
+                        Button::new("outline")
+                            .ghost()
+                            .label("Outline")
+                            .tooltip("Heading outline · ⇧⌘L")
+                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
+                    )
+                    .when(self.source && !self.help && self.document.is_some(), |d| {
+                        d.child(
+                            Button::new("copy-source")
+                                .ghost()
+                                .icon(if self.copied {
+                                    IconName::Check
+                                } else {
+                                    IconName::Copy
+                                })
+                                .label(if self.copied { "Copied" } else { "Copy" })
+                                .tooltip("Copy Markdown source")
+                                .on_click(cx.listener(|v, _, _, cx| v.copy_source(cx))),
+                        )
+                    })
+                    .child(
+                        Button::new("source")
+                            .ghost()
+                            .label(if self.source { "Preview" } else { "Source" })
+                            .tooltip("Read-only source · ⇧⌘M")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.source = !v.source;
+                                v.present(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("theme")
+                            .ghost()
+                            .icon(IconName::Sun)
+                            .tooltip("Toggle theme · ⇧⌘D")
+                            .on_click(cx.listener(|_, _, w, cx| {
+                                w.dispatch_action(Box::new(ToggleTheme), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("help")
+                            .ghost()
+                            .icon(IconName::Info)
+                            .tooltip("Shortcuts & Finder setup · ⌘/")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.help = !v.help;
+                                v.present(cx);
+                            })),
+                    ),
+            )
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
