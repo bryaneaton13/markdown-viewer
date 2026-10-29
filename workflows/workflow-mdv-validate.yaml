@@ -1,0 +1,27 @@
+id: 3ef60817-dc2b-441a-bdde-aff7b1656093
+name: mdv-validate
+description: Format check, tests and clippy for the workspace
+tags: {}
+jobs:
+  - name: checks
+    description: Run tests and clippy
+    steps:
+      - name: test
+        task:
+          type: model_method
+          modelIdOrName: mdv-test
+          methodName: execute
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: lint
+        task:
+          type: model_method
+          modelIdOrName: mdv-lint
+          methodName: execute
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

@@ -1,0 +1,12 @@
+type: command/shell
+typeVersion: 2026.02.09.1
+id: 4ce87fb3-83d6-48ae-be1f-2fbf77aef4c5
+name: mdv-package
+version: 1
+tags: {}
+globalArguments: {}
+methods:
+  execute:
+    arguments:
+      run: "scripts/package.sh"
+      timeout: 1800000

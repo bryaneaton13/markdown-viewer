@@ -1,0 +1,12 @@
+type: command/shell
+typeVersion: 2026.02.09.1
+id: 6516fe31-f820-4a05-a44e-75339c6294b1
+name: mdv-test
+version: 1
+tags: {}
+globalArguments: {}
+methods:
+  execute:
+    arguments:
+      run: "cargo fmt --all -- --check && cargo test --workspace"
+      timeout: 1800000
