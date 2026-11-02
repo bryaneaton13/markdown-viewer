@@ -46,6 +46,30 @@ pub enum Target {
     Split,
 }
 
+/// Where a drag over the panes would land.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DropZone {
+    /// The visible pane as a whole: an empty tab, or a narrow split.
+    Whole,
+    Left,
+    Right,
+}
+
+/// Markdown files and folders among paths dragged in from Finder; anything
+/// else is ignored.
+fn droppable(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut files = Vec::new();
+    let mut dirs = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            dirs.push(path.clone());
+        } else if markdown_core::is_markdown(path) {
+            files.push(path.clone());
+        }
+    }
+    (files, dirs)
+}
+
 /// Payload while a tab is dragged.
 #[derive(Clone)]
 struct DraggedTab {
@@ -85,8 +109,10 @@ pub struct Reader {
     active: usize,
     picker: Option<bool>, // false: files, true: headings
     split_state: Entity<ResizableState>,
-    /// While a tab is dragged over the panes: the half it would land in.
-    drop_zone: Option<bool>,
+    /// While a tab or Finder files are dragged over the panes: where they
+    /// would land, and what dropping there does.
+    drop_zone: Option<DropZone>,
+    drop_hint: SharedString,
     watched: Vec<(PathBuf, bool)>,
     _watch: Option<notify::RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
@@ -118,6 +144,7 @@ impl Reader {
             picker: None,
             split_state: cx.new(|_| ResizableState::default()),
             drop_zone: None,
+            drop_hint: SharedString::default(),
             watched: Vec::new(),
             _watch: None,
             _watch_task: None,
@@ -360,6 +387,128 @@ impl Reader {
             }
         })
         .detach();
+    }
+
+    // MARK: Dropping from Finder
+
+    /// Files and folders dropped outside the panes and tab strip: the same
+    /// as opening them from Finder.
+    fn drop_anywhere(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_zone = None;
+        let (files, dirs) = droppable(paths);
+        for path in dirs.into_iter().chain(files) {
+            self.open_path(path, window, cx);
+        }
+    }
+
+    /// Files dropped on the tab strip open as new tabs here.
+    fn drop_on_tabs(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let (files, dirs) = droppable(paths);
+        if !dirs.is_empty() {
+            return self.drop_anywhere(paths, window, cx);
+        }
+        for path in files {
+            self.open_in(path, Target::NewTab, window, cx);
+        }
+    }
+
+    /// What dropping `paths` at the given spot of the panes would do, or
+    /// `None` when there is nothing to open.
+    fn plan_drop(
+        &self,
+        paths: &[PathBuf],
+        right_half: bool,
+        narrow: bool,
+        cx: &App,
+    ) -> Option<(DropZone, SharedString)> {
+        let (files, dirs) = droppable(paths);
+        let more = |n: usize| match n {
+            0 => String::new(),
+            1 => " (+1 tab)".into(),
+            n => format!(" (+{n} tabs)"),
+        };
+        if !dirs.is_empty() {
+            let hint = match (dirs.len(), files.len()) {
+                (1, 0) => "Add folder as workspace".to_owned(),
+                (n, 0) => format!("Add {n} folders as workspaces"),
+                _ => "Open folders and files".to_owned(),
+            };
+            return Some((DropZone::Whole, hint.into()));
+        }
+        let n = files.len();
+        if n == 0 {
+            return None;
+        }
+        let tab = self.tab();
+        if tab.is_split() && narrow {
+            return Some((DropZone::Whole, format!("Open here{}", more(n - 1)).into()));
+        }
+        if !tab.is_split() && self.focused_pane().read(cx).is_blank() {
+            let hint = if n == 1 {
+                "Open".to_owned()
+            } else {
+                format!("Open side by side{}", more(n - 2))
+            };
+            return Some((DropZone::Whole, hint.into()));
+        }
+        let (zone, side) = if right_half {
+            (DropZone::Right, "right")
+        } else {
+            (DropZone::Left, "left")
+        };
+        let verb = if tab.is_split() {
+            "Replace"
+        } else {
+            "Open on the"
+        };
+        let hint = if tab.is_split() {
+            format!("{verb} {side} pane{}", more(n - 1))
+        } else {
+            format!("{verb} {side}{}", more(n - 1))
+        };
+        Some((zone, hint.into()))
+    }
+
+    /// Files dropped on the panes: into the side they were dropped on,
+    /// splitting the tab if needed. Extra files open as background tabs.
+    fn drop_on_panes(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let Some(zone) = self.drop_zone.take() else {
+            return;
+        };
+        let (files, dirs) = droppable(paths);
+        if !dirs.is_empty() {
+            return self.drop_anywhere(paths, window, cx);
+        }
+        let mut files = files.into_iter();
+        let Some(first) = files.next() else {
+            return;
+        };
+        let keep = self.ws().tabs.active;
+        match zone {
+            DropZone::Whole => {
+                let fill_split = !self.tab().is_split();
+                self.open_in(first, Target::Focused, window, cx);
+                if fill_split && let Some(second) = files.next() {
+                    self.open_in(second, Target::Split, window, cx);
+                }
+            }
+            DropZone::Left | DropZone::Right => {
+                let right = zone == DropZone::Right;
+                if self.tab().is_split() {
+                    self.ws_mut().tabs.active_mut().focus_right = right;
+                    self.open_in(first, Target::Focused, window, cx);
+                } else {
+                    let pane = Self::make_pane(None, window, cx);
+                    pane.update(cx, |p, cx| p.load_file(first, true, cx));
+                    self.ws_mut().tabs.active_mut().split_with(pane, right);
+                }
+            }
+        }
+        for path in files {
+            self.open_in(path, Target::NewTab, window, cx);
+        }
+        self.ws_mut().tabs.activate(keep);
+        self.after_tab_change(window, cx);
     }
 
     // MARK: Workspaces
@@ -930,6 +1079,21 @@ impl Reader {
             .border_r_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().sidebar)
+            // Folders dropped here become workspaces; files open in theirs.
+            .drag_over::<ExternalPaths>({
+                let accent = cx.theme().accent;
+                move |style, paths: &ExternalPaths, _, _| {
+                    let (files, dirs) = droppable(paths.paths());
+                    if files.is_empty() && dirs.is_empty() {
+                        style
+                    } else {
+                        style.bg(accent)
+                    }
+                }
+            })
+            .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
+                this.drop_anywhere(dragged.paths(), window, cx)
+            }))
             .child(
                 div()
                     .px_4()
@@ -1212,6 +1376,10 @@ impl Reader {
                         this.ws_mut().tabs.move_tab(dragged.from, last);
                         this.after_tab_change(window, cx);
                     }))
+                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
+                        this.drop_on_tabs(dragged.paths(), window, cx)
+                    }))
                     .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
                         this.ws_mut().tabs.pane_to_tab(dragged.right, true);
@@ -1391,7 +1559,11 @@ impl Reader {
                 .child(panel(true, cx))
                 .into_any_element()
         };
-        let zone = self.drop_zone;
+        let narrow = split && available < SPLIT_MIN_WIDTH;
+        // A drag that left the window leaves no stale highlight behind.
+        let zone = self.drop_zone.filter(|_| cx.has_active_drag());
+        let hint = self.drop_hint.clone();
+        let (popover, popover_border) = (cx.theme().popover, cx.theme().border);
         div()
             .id("panes")
             .relative()
@@ -1402,38 +1574,84 @@ impl Reader {
                 |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
                     let from = event.drag(cx).from;
                     let inside = event.bounds.contains(&event.event.position);
-                    let zone = (inside && this.ws().tabs.can_split_with(from))
-                        .then(|| event.event.position.x > event.bounds.center().x);
+                    let zone = (inside && this.ws().tabs.can_split_with(from)).then(|| {
+                        if event.event.position.x > event.bounds.center().x {
+                            DropZone::Right
+                        } else {
+                            DropZone::Left
+                        }
+                    });
                     if this.drop_zone != zone {
                         this.drop_zone = zone;
+                        this.drop_hint = SharedString::default();
                         cx.notify();
                     }
                 },
             ))
             .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
-                if let Some(right) = this.drop_zone.take() {
-                    this.ws_mut().tabs.merge_into_active(dragged.from, right);
+                if let Some(zone) = this.drop_zone.take() {
+                    this.ws_mut()
+                        .tabs
+                        .merge_into_active(dragged.from, zone == DropZone::Right);
                 }
                 this.after_tab_change(window, cx);
             }))
+            .on_drag_move::<ExternalPaths>(cx.listener(
+                move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let right_half = event.event.position.x > event.bounds.center().x;
+                    let plan = inside
+                        .then(|| this.plan_drop(event.drag(cx).paths(), right_half, narrow, cx))
+                        .flatten();
+                    let zone = plan.as_ref().map(|p| p.0);
+                    if this.drop_zone != zone {
+                        this.drop_zone = zone;
+                        this.drop_hint = plan.map(|p| p.1).unwrap_or_default();
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
+                this.drop_on_panes(dragged.paths(), window, cx)
+            }))
             .child(body)
-            .when_some(zone, |d, right| {
+            .when_some(zone, |d, zone| {
                 d.child(
                     div()
                         .absolute()
                         .top_0()
                         .bottom_0()
-                        .w(relative(0.5))
-                        .when(right, |d| d.right_0())
-                        .when(!right, |d| d.left_0())
+                        .map(|d| match zone {
+                            DropZone::Whole => d.left_0().right_0(),
+                            DropZone::Left => d.left_0().w(relative(0.5)),
+                            DropZone::Right => d.right_0().w(relative(0.5)),
+                        })
                         .p_2()
                         .child(
                             div()
                                 .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded_lg()
                                 .border_2()
                                 .border_color(primary)
-                                .bg(primary.opacity(0.08)),
+                                .bg(primary.opacity(0.08))
+                                .when(!hint.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .bg(popover)
+                                            .border_1()
+                                            .border_color(popover_border)
+                                            .shadow_md()
+                                            .child(hint),
+                                    )
+                                }),
                         ),
                 )
             })
@@ -1647,6 +1865,9 @@ impl Render for Reader {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
+            .on_drop(cx.listener(|v, dragged: &ExternalPaths, w, cx| {
+                v.drop_anywhere(dragged.paths(), w, cx)
+            }))
             .on_action(cx.listener(|v, _: &OpenFile, w, cx| v.prompt(false, w, cx)))
             .on_action(cx.listener(|v, _: &OpenFolder, w, cx| v.prompt(true, w, cx)))
             .on_action(cx.listener(|v, _: &ToggleSidebar, w, cx| v.toggle_sidebar(w, cx)))
@@ -1911,6 +2132,95 @@ mod tests {
         assert_eq!(pane(&view, cx, |p| p.match_index), 1);
         interact(w, cx, |w, cx| w.press("escape", cx));
         assert!(!pane(&view, cx, |p| p.find));
+    }
+
+    #[gpui_kit::test]
+    fn finder_drops_open_into_the_side_they_land_on(cx: &mut TestAppContext) {
+        let tmp = folder(&[
+            ("A.md", "# A"),
+            ("B.md", "# B"),
+            ("C.md", "# C"),
+            ("D.md", "# D"),
+            ("notes.txt", "not markdown"),
+        ]);
+        let p = |n: &str| tmp.path().join(n);
+        let (w, view) = open(cx);
+        let paths_of = |view: &Entity<Reader>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                v.tab()
+                    .panes()
+                    .map(|p| p.read(cx).path.clone().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Nothing droppable: no zone.
+        let plan = view.read_with(cx, |v, cx| v.plan_drop(&[p("notes.txt")], true, false, cx));
+        assert!(plan.is_none());
+
+        // Two files on an empty tab open side by side.
+        with_reader(w, &view, cx, |v, w, cx| {
+            let paths = [p("A.md"), p("B.md"), p("notes.txt")];
+            let (zone, hint) = v.plan_drop(&paths, true, false, cx).unwrap();
+            assert_eq!(zone, DropZone::Whole);
+            assert_eq!(hint.as_ref(), "Open side by side");
+            v.drop_zone = Some(zone);
+            v.drop_on_panes(&paths, w, cx);
+        });
+        assert_eq!(paths_of(&view, cx), [p("A.md"), p("B.md")]);
+
+        // A file on the left half of a split replaces that pane; extras open
+        // as background tabs and the split tab stays active.
+        with_reader(w, &view, cx, |v, w, cx| {
+            let paths = [p("C.md"), p("D.md")];
+            let (zone, hint) = v.plan_drop(&paths, false, false, cx).unwrap();
+            assert_eq!(zone, DropZone::Left);
+            assert_eq!(hint.as_ref(), "Replace left pane (+1 tab)");
+            v.drop_zone = Some(zone);
+            v.drop_on_panes(&paths, w, cx);
+        });
+        assert_eq!(paths_of(&view, cx), [p("C.md"), p("B.md")]);
+        assert!(!view.read_with(cx, |v, _| v.tab().focus_right));
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+
+        // On a single document, the right half splits it.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.ws_mut().tabs.activate(1);
+            let (zone, _) = v.plan_drop(&[p("A.md")], true, false, cx).unwrap();
+            assert_eq!(zone, DropZone::Right);
+            v.drop_zone = Some(zone);
+            v.drop_on_panes(&[p("A.md")], w, cx);
+        });
+        assert_eq!(paths_of(&view, cx), [p("D.md"), p("A.md")]);
+        assert!(view.read_with(cx, |v, _| v.tab().focus_right));
+
+        // Files on the tab strip open as new tabs.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.drop_on_tabs(&[p("B.md"), p("notes.txt")], w, cx)
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 3);
+        assert_eq!(paths_of(&view, cx), [p("B.md")]);
+    }
+
+    #[gpui_kit::test]
+    fn finder_folder_drops_add_workspaces(cx: &mut TestAppContext) {
+        let one = folder(&[("A.md", "# A")]);
+        let two = folder(&[("B.md", "# B")]);
+        let (w, view) = open(cx);
+        let before = view.read_with(cx, |v, _| v.workspaces.len());
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.drop_anywhere(&[one.path().into(), two.path().into()], w, cx)
+        });
+        view.read_with(cx, |v, _| {
+            assert!(v.workspaces.len() > before);
+            assert_eq!(v.ws().root.as_deref(), Some(two.path()));
+            assert!(
+                v.workspaces
+                    .iter()
+                    .any(|ws| ws.root.as_deref() == Some(one.path()))
+            );
+            assert!(v.prefs.sidebar);
+        });
     }
 
     #[gpui_kit::test]

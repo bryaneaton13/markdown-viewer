@@ -110,6 +110,8 @@ Press ⌘/ in the app for this list and the Finder setup notes.
 
 Drag a tab onto the left or right half of the page to read it beside the current one, and drag a pane header back to the tab bar to separate them. A tab holds at most two panes.
 
+You can also drag Markdown files in from Finder. Drop one on the left or right half of the page to open it in that pane, or drop two on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs. Folders dropped on the sidebar become workspaces.
+
 The app keeps running after you close its window; quit with ⌘Q. Settings, including open workspaces and tabs, live in `~/Library/Application Support/Markdown Viewer/settings.json`.
 
 ## Limitations

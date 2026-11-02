@@ -10,6 +10,7 @@ Planned for 0.2.0.
 - **Workspaces.** Each added folder becomes a workspace with its own file tree and tabs. Switch from the sidebar header menu, with ⌃1–9, or with ⌃⌘[ / ⌃⌘]. Files opened from Finder go to the workspace whose folder contains them, or to a "Files" workspace.
 - **Tabs.** ⌘T opens a new tab, ⌘W closes a pane or tab, ⇧⌘T reopens the last closed one, and ⌃Tab / ⇧⌘] / ⇧⌘[ switch tabs. Tabs can be pinned, reordered by dragging, and closed from a context menu. The tab strip only shows when a workspace has more than one tab.
 - **Side-by-side split.** ⌘\ shows a document twice, or separates a split back into two tabs. Drag a tab onto the left or right half of the page to read it beside the current one, and drag a pane header to the tab bar to separate it again. Splits stop at two panes. In narrow windows a split shows one pane at a time with a switcher.
+- **Drag from Finder.** Drop a Markdown file on the left or right half of the page to open it in that pane, splitting the tab if needed. Drop two files on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs, and folders dropped on the sidebar (or anywhere else) become workspaces.
 - ⌘-click a file in the tree, or press ⌘↵ in Quick Open, to open it in a new tab. ⌥-click or ⌥↵ opens it in the other pane.
 - Workspaces, tabs, splits and Source mode are restored at launch. Restored tabs read their file the first time they are shown.
 
