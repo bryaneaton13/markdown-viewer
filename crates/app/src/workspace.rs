@@ -1,9 +1,10 @@
 //! A workspace: one folder's file tree plus the tabs opened from it. The
-//! window keeps several and shows one at a time. A workspace without a root
-//! ("Files") collects documents opened from outside every folder.
+//! window keeps several, lists them all in the sidebar, and shows one's tabs
+//! at a time. A workspace without a root ("Open Files") collects documents
+//! opened from outside every folder.
 
-use crate::{files, pane::DocPane, tabs::TabSet};
-use gpui_kit::{Entity, Task, UniformListScrollHandle};
+use crate::{files, pane::DocPane, sidebar, tabs::TabSet};
+use gpui_kit::{Entity, Task};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -12,13 +13,17 @@ use std::{
 pub struct Workspace {
     pub root: Option<PathBuf>,
     pub files: Vec<PathBuf>,
+    /// The visible tree: a folder's expanded entries, or for loose files,
+    /// the documents open in its tabs.
     pub rows: Vec<files::Row>,
     pub expanded: HashSet<PathBuf>,
-    pub selected: usize,
-    pub tree_scroll: UniformListScrollHandle,
+    /// Open (expanded) in the sidebar.
+    pub open: bool,
+    /// When it was last the active workspace, in Unix milliseconds.
+    pub last_used: u64,
     pub indexing: bool,
     pub limited: bool,
-    /// Whether `files` reflects the folder (inactive workspaces scan lazily).
+    /// Whether `files` reflects the folder (collapsed workspaces scan lazily).
     pub scanned: bool,
     pub tabs: TabSet<Entity<DocPane>>,
     pub scan_generation: usize,
@@ -32,8 +37,8 @@ impl Workspace {
             files: Vec::new(),
             rows: Vec::new(),
             expanded: HashSet::new(),
-            selected: 0,
-            tree_scroll: UniformListScrollHandle::new(),
+            open: true,
+            last_used: 0,
             indexing: false,
             limited: false,
             scanned: false,
@@ -52,13 +57,36 @@ impl Workspace {
         self.root.as_ref().is_some_and(|r| path.starts_with(r))
     }
 
+    /// Rebuild a folder's rows from its files. Loose files get theirs from
+    /// `set_loose_rows`.
     pub fn rebuild_rows(&mut self) {
-        self.rows = self
-            .root
-            .as_ref()
-            .map(|r| files::rows(r, &self.files, &self.expanded))
-            .unwrap_or_default();
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        if let Some(root) = &self.root {
+            self.rows = files::rows(root, &self.files, &self.expanded);
+        }
+    }
+
+    /// The loose workspace lists its open documents, in tab order.
+    pub fn set_loose_rows(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut seen = HashSet::new();
+        self.rows = paths
+            .into_iter()
+            .filter(|p| seen.insert(p.clone()))
+            .map(|path| files::Row {
+                path,
+                depth: 0,
+                directory: false,
+            })
+            .collect();
+    }
+
+    pub fn summary(&self) -> sidebar::Summary {
+        sidebar::Summary {
+            name: self.name(),
+            folder: self.root.is_some(),
+            open: self.open,
+            rows: self.rows.len(),
+            last_used: self.last_used,
+        }
     }
 }
 
@@ -68,12 +96,12 @@ pub fn name_of(root: Option<&Path>) -> String {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| root.to_string_lossy().into_owned()),
-        None => "Files".into(),
+        None => "Open Files".into(),
     }
 }
 
 /// The workspace a file opened from Finder belongs to: the one with the
-/// deepest folder containing it, else the loose "Files" workspace.
+/// deepest folder containing it, else the loose "Open Files" workspace.
 pub fn home_for(roots: &[Option<&Path>], path: &Path) -> Option<usize> {
     roots
         .iter()
@@ -82,6 +110,13 @@ pub fn home_for(roots: &[Option<&Path>], path: &Path) -> Option<usize> {
         .max_by_key(|(_, r)| r.components().count())
         .map(|(i, _)| i)
         .or_else(|| roots.iter().position(|r| r.is_none()))
+}
+
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -98,6 +133,6 @@ mod tests {
         assert_eq!(home_for(&roots, Path::new("/elsewhere/z.md")), Some(1));
         assert_eq!(home_for(&roots[..1], Path::new("/elsewhere/z.md")), None);
         assert_eq!(name_of(Some(&b)), "docs");
-        assert_eq!(name_of(None), "Files");
+        assert_eq!(name_of(None), "Open Files");
     }
 }

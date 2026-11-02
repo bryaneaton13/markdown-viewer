@@ -28,7 +28,7 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 - Folder tree and filtered **Quick Open** (⌘P) for `.md` and `.markdown` files.
 - Find against the *rendered* text, with match highlighting and next/previous.
 - Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
-- **Workspaces** for several folders, each with its own **tabs**, and a **side-by-side split** of two documents (⌘\\).
+- **Workspaces** for several folders, listed together in the sidebar as folders that open and close, each with its own **tabs**, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
 - Back/forward history per pane, light/dark mode, adjustable text size, and automatic reload when a file changes on disk.
 - Finder and Dock "open with" support. Preferences persist between launches.
 - **Finder Quick Look**: press Space on a Markdown file for an offline rendered preview.
@@ -92,7 +92,7 @@ Press ⌘/ in the app for this list and the Finder setup notes.
 | ⌃Tab, ⇧⌘] / ⇧⌘[ | Next / previous tab |
 | ⌘\\ | Split side by side / separate into tabs |
 | ⌥⌘← / ⌥⌘→ | Focus left / right pane |
-| ⌃1 … ⌃9, ⌃⌘] / ⌃⌘[ | Switch workspace |
+| ⌃1 … ⌃9, ⌃⌘] / ⌃⌘[ | Switch workspace (in sidebar order) |
 | ⌘-click / ⌥-click in tree | Open in new tab / other pane |
 | ⌘B or ⌃⌘S | Show/hide sidebar |
 | ⌘1 / ⌘2 | Focus tree / document |
@@ -142,7 +142,7 @@ scripts/                bundle/install, packaging, screenshots, validation
 docs/                   original research and design plan
 ```
 
-`scripts/shot.sh OUT.png FILE STATES` captures the real GPUI window with Metal `render_to_image`, with no screen-recording permission needed. `STATES` is a comma-separated list of `light`, `dark`, `browse` (add the file's folder as a workspace), `workspace:/path`, `tab:relative/path.md`, `split:relative/path.md` (paths relative to the workspace; `~` for a space), `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help`. Set `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` to keep experiments away from your real settings.
+`scripts/shot.sh OUT.png FILE STATES` captures the real GPUI window with Metal `render_to_image`, with no screen-recording permission needed. `STATES` is a comma-separated list of `light`, `dark`, `browse` (add the file's folder as a workspace), `workspace:/path`, `switch:N` (activate the Nth workspace, from 0), `collapse:N` (open or close the Nth), `sidebar-focus`, `tab:relative/path.md`, `split:relative/path.md` (paths relative to the workspace; `~` for a space), `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help`. Set `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` to keep experiments away from your real settings.
 
 `scripts/check-quicklook.sh` compiles and calls the same Swift-to-Rust bridge the extension uses and writes `reports/quicklook.html`. It checks rendering, not Finder's choice of preview provider, so test that with an installed bundle.
 

@@ -1,3 +1,4 @@
+use crate::sidebar::Sort;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -10,6 +11,8 @@ pub struct Preferences {
     /// Open workspaces, in sidebar order.
     pub workspaces: Vec<SavedWorkspace>,
     pub active_workspace: usize,
+    /// How the sidebar orders folder workspaces.
+    pub sidebar_sort: Sort,
     /// Pre-0.2 single folder / file. Read once and folded into `workspaces`.
     #[serde(skip_serializing)]
     pub folder: Option<PathBuf>,
@@ -26,6 +29,12 @@ pub struct SavedWorkspace {
     pub expanded: Vec<PathBuf>,
     pub tabs: Vec<SavedTab>,
     pub active_tab: usize,
+    /// Closed in the sidebar.
+    #[serde(skip_serializing_if = "is_false")]
+    pub collapsed: bool,
+    /// Unix milliseconds it was last active, for "Recently Used" order.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub last_used: u64,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
@@ -52,6 +61,10 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -60,6 +73,7 @@ impl Default for Preferences {
             dark: None,
             workspaces: Vec::new(),
             active_workspace: 0,
+            sidebar_sort: Sort::Manual,
             folder: None,
             file: None,
         }
@@ -173,12 +187,18 @@ mod tests {
                 SavedTab::default(),
             ],
             active_tab: 1,
+            collapsed: true,
+            last_used: 42,
         });
         prefs.active_workspace = 3;
+        prefs.sidebar_sort = Sort::Recent;
         let back: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         let back = back.normalized();
         assert_eq!(back.workspaces, prefs.workspaces);
         assert_eq!(back.active_workspace, 0, "clamped");
+        assert_eq!(back.sidebar_sort, Sort::Recent);
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(json.contains(r#""sidebar_sort":"recent""#));
     }
 }

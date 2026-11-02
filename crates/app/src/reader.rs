@@ -1,20 +1,24 @@
 //! The window: title-bar toolbar, workspace sidebar, tab strip, and one or
 //! two document panes side by side. Document state lives in `DocPane`; this
 //! view routes actions to the focused pane and owns workspaces and tabs.
+//! The sidebar lists every workspace as a folder that opens and closes
+//! (layout in `sidebar.rs`); the active one owns the tab strip.
 
 use crate::{
     actions::*,
     files,
     pane::{DocPane, FontSize, PaneEvent},
     preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
+    sidebar::{self, Item, Sort},
     tabs::{Tab, TabSet},
-    workspace::{Workspace, home_for},
+    workspace::{Workspace, home_for, now_millis},
 };
 use gpui_kit::{
+    assets::IconName as Lucide,
     component::{
         button::*,
         command::{Command, CommandGroup, CommandItem, CommandState},
-        menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
         resizable::{ResizableState, h_resizable, resizable_panel},
         *,
     },
@@ -27,11 +31,13 @@ use std::{
     ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     time::Duration,
 };
 
 const TOOLBAR_HEIGHT: f32 = 44.;
 const SIDEBAR_WIDTH: f32 = 242.;
+const SIDEBAR_ROW: f32 = 30.;
 /// Below this content width a split tab shows one pane at a time.
 const SPLIT_MIN_WIDTH: f32 = 720.;
 
@@ -76,6 +82,20 @@ struct DraggedTab {
     from: usize,
 }
 
+/// Payload while a workspace's folder row is dragged to reorder.
+#[derive(Clone)]
+struct DraggedWorkspace {
+    ws: usize,
+}
+
+/// The sidebar row the keyboard is on: a workspace's folder row (`path` is
+/// `None`) or a path in its tree. Kept by path so it survives rescans.
+#[derive(Clone, PartialEq, Debug)]
+struct Cursor {
+    ws: usize,
+    path: Option<PathBuf>,
+}
+
 /// Payload while a pane header is dragged out to the tab strip.
 #[derive(Clone)]
 struct DraggedPane {
@@ -108,6 +128,8 @@ pub struct Reader {
     workspaces: Vec<Workspace>,
     active: usize,
     picker: Option<bool>, // false: files, true: headings
+    cursor: Option<Cursor>,
+    tree_scroll: UniformListScrollHandle,
     split_state: Entity<ResizableState>,
     /// While a tab or Finder files are dragged over the panes: where they
     /// would land, and what dropping there does.
@@ -142,6 +164,8 @@ impl Reader {
             workspaces: Vec::new(),
             active: 0,
             picker: None,
+            cursor: None,
+            tree_scroll: UniformListScrollHandle::new(),
             split_state: cx.new(|_| ResizableState::default()),
             drop_zone: None,
             drop_hint: SharedString::default(),
@@ -174,13 +198,20 @@ impl Reader {
             let tabs = TabSet::restore(tabs, ws.active_tab, || Self::make_pane(None, window, cx));
             let mut workspace = Workspace::new(ws.root.clone(), tabs);
             workspace.expanded = ws.expanded.iter().cloned().collect();
+            workspace.open = !ws.collapsed;
+            workspace.last_used = ws.last_used;
             this.workspaces.push(workspace);
         }
         if this.workspaces.is_empty() {
             this.push_workspace(None, window, cx);
         }
         this.active = this.prefs.active_workspace.min(this.workspaces.len() - 1);
-        this.scan(this.active, cx);
+        for ix in 0..this.workspaces.len() {
+            if ix == this.active || this.workspaces[ix].open {
+                this.scan(ix, cx);
+            }
+        }
+        this.refresh_loose(cx);
         this.rewatch(cx);
         if let Some(path) = path {
             this.open_path(path, window, cx);
@@ -203,6 +234,7 @@ impl Reader {
     }
 
     fn pane_changed(&mut self, cx: &mut Context<Self>) {
+        self.refresh_loose(cx);
         self.rewatch(cx);
         self.save(cx);
         cx.notify();
@@ -308,22 +340,51 @@ impl Reader {
             self.active = ix;
             self.after_workspace_change(window, cx);
         }
-        let showing = self.ws().tabs.tabs.iter().enumerate().find_map(|(i, t)| {
-            let right = t
-                .panes()
-                .position(|p| p.read(cx).path.as_ref() == Some(&path))?;
-            Some((i, right == 1))
-        });
-        if let Some((tab, right)) = showing {
-            let tabs = &mut self.ws_mut().tabs;
-            tabs.activate(tab);
-            tabs.active_mut().focus_right = right;
-            self.after_tab_change(window, cx);
+        if self.show_existing(&path, window, cx) {
         } else if self.focused_pane().read(cx).is_blank() {
             self.open_in(path, Target::Focused, window, cx);
         } else {
             self.open_in(path, Target::NewTab, window, cx);
         }
+    }
+
+    /// Bring forward the tab and pane already showing `path` in the active
+    /// workspace, if any.
+    fn show_existing(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let showing = self.ws().tabs.tabs.iter().enumerate().find_map(|(i, t)| {
+            let right = t
+                .panes()
+                .position(|p| p.read(cx).path.as_deref() == Some(path))?;
+            Some((i, right == 1))
+        });
+        let Some((tab, right)) = showing else {
+            return false;
+        };
+        let tabs = &mut self.ws_mut().tabs;
+        tabs.activate(tab);
+        tabs.active_mut().focus_right = right;
+        self.after_tab_change(window, cx);
+        true
+    }
+
+    /// Open a file from a workspace's tree in the sidebar, making that
+    /// workspace active. A plain click goes to a tab already showing it.
+    fn open_from_tree(
+        &mut self,
+        ws: usize,
+        path: PathBuf,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ws != self.active {
+            self.active = ws;
+            self.after_workspace_change(window, cx);
+        }
+        if target == Target::Focused && self.show_existing(&path, window, cx) {
+            return;
+        }
+        self.open_in(path, target, window, cx);
     }
 
     /// Open a file from the tree or Quick Open.
@@ -520,10 +581,36 @@ impl Reader {
         }
     }
 
+    /// Workspaces as the sidebar shows them, skipping a hidden "Open Files".
+    fn shown_order(&self) -> Vec<usize> {
+        let summaries = self.summaries();
+        sidebar::order(&summaries, self.prefs.sidebar_sort)
+            .into_iter()
+            .filter(|&ws| sidebar::visible(&summaries[ws]) || ws == self.active)
+            .collect()
+    }
+
+    /// ⌃1–9: the nth workspace in sidebar order, opened and scrolled to.
+    fn switch_to_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&ws) = self.shown_order().get(n) else {
+            return;
+        };
+        if ws == self.active && !self.ws().open {
+            self.toggle_open(ws, cx);
+        }
+        self.activate_workspace(ws, window, cx);
+        if let Some(ix) = self.layout().iter().position(|&i| i == Item::Header(ws)) {
+            self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+        }
+    }
+
     fn cycle_workspace(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.workspaces.len() as isize;
-        let ix = (self.active as isize + delta).rem_euclid(n) as usize;
-        self.activate_workspace(ix, window, cx);
+        let order = self.shown_order();
+        let Some(at) = order.iter().position(|&ws| ws == self.active) else {
+            return;
+        };
+        let next = (at as isize + delta).rem_euclid(order.len() as isize) as usize;
+        self.switch_to_nth(next, window, cx);
     }
 
     fn close_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -537,16 +624,109 @@ impl Reader {
         if self.active > ix || self.active >= self.workspaces.len() {
             self.active = self.active.saturating_sub(1);
         }
+        self.cursor = self.cursor.take().and_then(|mut c| {
+            if c.ws == ix {
+                return None;
+            }
+            c.ws -= (c.ws > ix) as usize;
+            Some(c)
+        });
         self.after_workspace_change(window, cx);
     }
 
     fn after_workspace_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         self.drop_zone = None;
-        // Files may have changed while the folder wasn't watched.
-        self.scan(self.active, cx);
+        let ws = self.ws_mut();
+        ws.open = true;
+        ws.last_used = now_millis();
+        // Unwatched folders may have changed since they were last scanned.
+        let root = self.ws().root.clone();
+        if !self.ws().scanned || !self.watched.iter().any(|(p, _)| Some(p) == root.as_ref()) {
+            self.scan(self.active, cx);
+        }
         self.rewatch(cx);
         self.after_tab_change(window, cx);
+    }
+
+    /// Open or close a workspace's folder in the sidebar. This never changes
+    /// which workspace is active.
+    fn toggle_open(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let ws = &mut self.workspaces[ix];
+        ws.open = !ws.open;
+        if ws.open && !ws.scanned {
+            self.scan(ix, cx);
+        }
+        if !self.workspaces[ix].open
+            && let Some(c) = self.cursor.as_mut()
+            && c.ws == ix
+        {
+            c.path = None;
+        }
+        self.rewatch(cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Close every workspace but the active one; if that's already the
+    /// case, close the active one too.
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let active = self.active;
+        let others_open = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .any(|(i, w)| i != active && w.open);
+        for (i, ws) in self.workspaces.iter_mut().enumerate() {
+            if i != active || !others_open {
+                ws.open = false;
+            }
+        }
+        if let Some(c) = self.cursor.as_mut()
+            && !self.workspaces[c.ws].open
+        {
+            c.path = None;
+        }
+        self.rewatch(cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn set_sort(&mut self, sort: Sort, cx: &mut Context<Self>) {
+        self.prefs.sidebar_sort = sort;
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// Drag a workspace onto another: it takes that place, and the sidebar
+    /// switches to (and keeps) the resulting manual order.
+    fn move_workspace(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let order = sidebar::order(&self.summaries(), self.prefs.sidebar_sort);
+        let order = sidebar::reorder(&order, from, to);
+        let mut old: Vec<Option<Workspace>> = self.workspaces.drain(..).map(Some).collect();
+        self.workspaces = order.iter().filter_map(|&i| old[i].take()).collect();
+        let remap = |ix: usize| order.iter().position(|&i| i == ix).unwrap_or(ix);
+        self.active = remap(self.active);
+        if let Some(c) = self.cursor.as_mut() {
+            c.ws = remap(c.ws);
+        }
+        self.prefs.sidebar_sort = Sort::Manual;
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// The loose-files workspace lists the documents open in its tabs.
+    fn refresh_loose(&mut self, cx: &App) {
+        for ws in &mut self.workspaces {
+            if ws.root.is_none() {
+                let paths: Vec<PathBuf> = ws
+                    .tabs
+                    .panes()
+                    .filter_map(|p| p.read(cx).path.clone())
+                    .collect();
+                ws.set_loose_rows(paths);
+            }
+        }
     }
 
     // MARK: Tabs and panes
@@ -557,6 +737,7 @@ impl Reader {
         if !self.tree_focus.is_focused(window) {
             self.focus_reader(window, cx);
         }
+        self.refresh_loose(cx);
         self.save(cx);
         cx.notify();
     }
@@ -643,8 +824,7 @@ impl Reader {
             return;
         };
         let Some(root) = ws.root.clone() else {
-            ws.files.clear();
-            ws.rows.clear();
+            ws.scanned = true;
             return;
         };
         ws.scan_generation += 1;
@@ -675,12 +855,20 @@ impl Reader {
         cx.notify();
     }
 
-    /// Watch the active workspace's folder, plus the folders of open files
-    /// that live outside it. Only the active workspace is watched; others
-    /// rescan when activated.
+    /// Watch the folders of the active workspace and of every workspace
+    /// open in the sidebar, plus the folders of the active workspace's open
+    /// files that live outside it. Closed workspaces rescan when reopened.
     fn rewatch(&mut self, cx: &mut Context<Self>) {
+        let mut wanted: Vec<(PathBuf, bool)> = Vec::new();
+        for (ix, ws) in self.workspaces.iter().enumerate() {
+            if let Some(root) = &ws.root
+                && (ix == self.active || ws.open)
+                && !wanted.iter().any(|(p, _)| p == root)
+            {
+                wanted.push((root.clone(), true));
+            }
+        }
         let ws = self.ws();
-        let mut wanted: Vec<(PathBuf, bool)> = ws.root.iter().map(|r| (r.clone(), true)).collect();
         for pane in ws.tabs.panes() {
             if let Some(parent) = pane.read(cx).path.as_ref().and_then(|p| p.parent())
                 && !ws.contains(parent)
@@ -693,6 +881,11 @@ impl Reader {
             return;
         }
         self.watched = wanted.clone();
+        // FSEvents would wake the deterministic test scheduler from its own
+        // thread; tests drive `files_changed` directly instead.
+        if cfg!(test) {
+            return;
+        }
         let (tx, rx) = async_channel::unbounded::<Vec<PathBuf>>();
         let Ok(mut watcher) =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
@@ -728,16 +921,37 @@ impl Reader {
         }));
     }
 
-    /// Rescan the tree and reload every open pane showing a changed file.
-    /// Paths are matched by name, since the watcher may report them through
-    /// a different (resolved) prefix.
+    /// Rescan the watched folders the changes fall under, and reload every
+    /// pane showing a changed file. Panes are matched by name, since the
+    /// watcher may report paths through a different (resolved) prefix.
     fn files_changed(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
         let names: HashSet<OsString> = changed
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_owned()))
             .collect();
-        self.scan(self.active, cx);
-        let panes: Vec<_> = self.ws().tabs.panes().cloned().collect();
+        let affected: Vec<usize> = (0..self.workspaces.len())
+            .filter(|&ix| {
+                let Some(root) = &self.workspaces[ix].root else {
+                    return false;
+                };
+                let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                self.watched.iter().any(|(p, _)| p == root)
+                    && changed
+                        .iter()
+                        .any(|p| p.starts_with(root) || p.starts_with(&real))
+            })
+            .collect();
+        if affected.is_empty() {
+            self.scan(self.active, cx);
+        }
+        for ix in affected {
+            self.scan(ix, cx);
+        }
+        let panes: Vec<_> = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.panes().cloned())
+            .collect();
         for pane in panes {
             let hit = pane
                 .read(cx)
@@ -775,6 +989,8 @@ impl Reader {
                         })
                         .collect(),
                     active_tab: ws.tabs.active,
+                    collapsed: !ws.open,
+                    last_used: ws.last_used,
                 }
             })
             .collect();
@@ -822,49 +1038,220 @@ impl Reader {
                 path
             }
             Some(true) => return,
-            None => self
-                .ws()
-                .rows
-                .get(self.ws().selected)
-                .filter(|r| !r.directory)
-                .map(|r| r.path.clone()),
+            None => {
+                let items = self.layout();
+                let hit = self
+                    .cursor_index(&items, cx)
+                    .and_then(|ix| match items[ix] {
+                        Item::Entry { ws, row } => {
+                            let row = &self.workspaces[ws].rows[row];
+                            (!row.directory).then(|| (ws, row.path.clone()))
+                        }
+                        _ => None,
+                    });
+                if let Some((ws, path)) = hit {
+                    self.open_from_tree(ws, path, target, window, cx);
+                }
+                return;
+            }
         };
         if let Some(path) = path {
             self.open_in(path, target, window, cx);
         }
     }
 
+    // MARK: Sidebar tree
+
+    fn summaries(&self) -> Vec<sidebar::Summary> {
+        self.workspaces.iter().map(Workspace::summary).collect()
+    }
+
+    /// Workspace indices in sidebar order.
+    fn order(&self) -> Vec<usize> {
+        sidebar::order(&self.summaries(), self.prefs.sidebar_sort)
+    }
+
+    /// The sidebar's rows, top to bottom.
+    fn layout(&self) -> Vec<Item> {
+        let summaries = self.summaries();
+        sidebar::layout(
+            &summaries,
+            &sidebar::order(&summaries, self.prefs.sidebar_sort),
+        )
+    }
+
+    fn row(&self, item: Item) -> Option<&files::Row> {
+        match item {
+            Item::Entry { ws, row } => self.workspaces.get(ws)?.rows.get(row),
+            _ => None,
+        }
+    }
+
+    fn cursor_at(&self, item: Item) -> Option<Cursor> {
+        match item {
+            Item::Header(ws) => Some(Cursor { ws, path: None }),
+            Item::Entry { ws, .. } => Some(Cursor {
+                ws,
+                path: Some(self.row(item)?.path.clone()),
+            }),
+            Item::Empty(_) => None,
+        }
+    }
+
+    fn is_cursor(&self, item: Item) -> bool {
+        let Some(c) = &self.cursor else {
+            return false;
+        };
+        match item {
+            Item::Header(ws) => c.ws == ws && c.path.is_none(),
+            Item::Entry { ws, .. } => {
+                c.ws == ws && c.path.as_ref() == self.row(item).map(|r| &r.path)
+            }
+            Item::Empty(_) => false,
+        }
+    }
+
+    /// The keyboard's row: the cursor, else the current file in the active
+    /// workspace, else the active workspace's folder row.
+    fn cursor_index(&self, items: &[Item], cx: &App) -> Option<usize> {
+        let current = self.focused_pane().read(cx).path.clone();
+        items
+            .iter()
+            .position(|&i| self.is_cursor(i))
+            .or_else(|| {
+                items.iter().position(|&i| {
+                    i.ws() == self.active
+                        && self
+                            .row(i)
+                            .is_some_and(|r| Some(&r.path) == current.as_ref())
+                })
+            })
+            .or_else(|| items.iter().position(|&i| i == Item::Header(self.active)))
+    }
+
+    fn set_cursor(&mut self, items: &[Item], ix: usize) {
+        self.cursor = self.cursor_at(items[ix]);
+        self.tree_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+    }
+
+    /// ↑ / ↓ across every open workspace. Landing on a file in the active
+    /// workspace previews it; other workspaces wait for ↵ or a click.
     fn tree_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ws = self.ws_mut();
-        if ws.rows.is_empty() {
+        let items = self.layout();
+        if items.is_empty() {
             return;
         }
-        ws.selected = ws
-            .selected
-            .saturating_add_signed(delta)
-            .min(ws.rows.len() - 1);
-        ws.tree_scroll
-            .scroll_to_item(ws.selected, ScrollStrategy::Nearest);
-        let row = ws.rows[ws.selected].clone();
-        if !row.directory {
-            self.open_in(row.path, Target::Focused, window, cx);
+        let step = if delta < 0 { -1 } else { 1 };
+        let mut ix = match self.cursor_index(&items, cx) {
+            Some(ix) => ix as isize + delta,
+            None => 0,
+        };
+        while ix >= 0
+            && items
+                .get(ix as usize)
+                .is_some_and(|i| matches!(i, Item::Empty(_)))
+        {
+            ix += step;
+        }
+        let Some(&item) = usize::try_from(ix).ok().and_then(|ix| items.get(ix)) else {
+            return;
+        };
+        self.set_cursor(&items, ix as usize);
+        if item.ws() == self.active
+            && let Some(row) = self.row(item).filter(|r| !r.directory).cloned()
+        {
+            self.open_from_tree(item.ws(), row.path, Target::Focused, window, cx);
         }
         cx.notify();
     }
 
+    fn toggle_dir(&mut self, ws: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        let ws = &mut self.workspaces[ws];
+        if !ws.expanded.remove(&dir) {
+            ws.expanded.insert(dir);
+        }
+        ws.rebuild_rows();
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// ↵ or a click: open or close a folder, or open a file.
     fn tree_open(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
-        let ws = self.ws_mut();
-        if let Some(row) = ws.rows.get(ws.selected).cloned() {
-            if row.directory {
-                if !ws.expanded.remove(&row.path) {
-                    ws.expanded.insert(row.path);
+        let items = self.layout();
+        let Some(ix) = self.cursor_index(&items, cx) else {
+            return;
+        };
+        match items[ix] {
+            Item::Header(ws) => self.toggle_open(ws, cx),
+            item @ Item::Entry { ws, .. } => {
+                let Some(row) = self.row(item).cloned() else {
+                    return;
+                };
+                if row.directory {
+                    self.toggle_dir(ws, row.path, cx);
+                } else {
+                    self.open_from_tree(ws, row.path, target, window, cx);
                 }
-                ws.rebuild_rows();
-                self.save(cx);
-                cx.notify();
-            } else {
-                self.open_in(row.path, target, window, cx);
             }
+            Item::Empty(_) => {}
+        }
+    }
+
+    /// ←: close the folder under the cursor, else go up to its parent.
+    fn tree_left(&mut self, cx: &mut Context<Self>) {
+        let items = self.layout();
+        let Some(ix) = self.cursor_index(&items, cx) else {
+            return;
+        };
+        match items[ix] {
+            Item::Header(ws) => {
+                if self.workspaces[ws].open {
+                    self.toggle_open(ws, cx);
+                }
+            }
+            item @ Item::Entry { ws, .. } => {
+                let Some(row) = self.row(item).cloned() else {
+                    return;
+                };
+                if row.directory && self.workspaces[ws].expanded.contains(&row.path) {
+                    return self.toggle_dir(ws, row.path, cx);
+                }
+                let parent = row.path.parent();
+                let up = items
+                    .iter()
+                    .position(|&i| {
+                        i.ws() == ws
+                            && row.depth > 0
+                            && self.row(i).map(|r| r.path.as_path()) == parent
+                    })
+                    .or_else(|| items.iter().position(|&i| i == Item::Header(ws)));
+                if let Some(up) = up {
+                    self.set_cursor(&items, up);
+                }
+                cx.notify();
+            }
+            Item::Empty(_) => {}
+        }
+    }
+
+    /// →: open the folder under the cursor, else move down.
+    fn tree_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self.layout();
+        let Some(ix) = self.cursor_index(&items, cx) else {
+            return;
+        };
+        let closed = match items[ix] {
+            Item::Header(ws) => !self.workspaces[ws].open,
+            item @ Item::Entry { ws, .. } => self
+                .row(item)
+                .is_some_and(|r| r.directory && !self.workspaces[ws].expanded.contains(&r.path)),
+            Item::Empty(_) => false,
+        };
+        if closed {
+            self.cursor = self.cursor_at(items[ix]);
+            self.tree_open(Target::Focused, window, cx);
+        } else {
+            self.tree_move(1, window, cx);
         }
     }
 
@@ -896,6 +1283,7 @@ impl Reader {
         let pane = pane.read(cx);
         let (source, help, has_doc, copied) =
             (pane.source, pane.help, pane.document.is_some(), pane.copied);
+        let workspace = self.ws().root.as_ref().map(|_| self.ws().name());
         // 44px toolbar doubles as the title bar; traffic lights are centered in it (main.rs).
         TitleBar::new()
             .h(px(TOOLBAR_HEIGHT))
@@ -939,15 +1327,30 @@ impl Reader {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(if pane.path.is_some() || help {
-                                pane.title()
-                            } else {
-                                "Markdown Viewer".into()
-                            }),
+                            // Which workspace this tab strip belongs to.
+                            .when_some(workspace, |d, name| {
+                                d.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{name}  /")),
+                                )
+                            })
+                            .child(div().min_w_0().truncate().child(
+                                if pane.path.is_some() || help {
+                                    pane.title()
+                                } else {
+                                    "Markdown Viewer".into()
+                                },
+                            )),
                     )
                     .child(
                         Button::new("quick-open")
@@ -1018,55 +1421,344 @@ impl Reader {
             )
     }
 
-    /// Sidebar header: the active workspace, with a menu to switch, add or
-    /// close workspaces.
-    fn workspace_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The title strip of the sidebar: sort, collapse all, add folder.
+    fn sidebar_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
-        let names: Vec<(String, bool)> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(i, w)| (w.name(), i == self.active))
-            .collect();
-        let focus = self.focus.clone();
-        let label = if self.ws().root.is_none() && self.workspaces.len() == 1 {
-            "Open folder…".to_string()
-        } else {
-            self.ws().name()
-        };
-        Button::new("workspace-switcher")
-            .ghost()
-            .w_full()
-            .justify_start()
-            .icon(IconName::FolderOpen)
-            .label(label)
-            .dropdown_caret(true)
-            .tooltip("Switch workspace · ⌃1–9")
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu.action_context(focus.clone()).min_w(px(220.));
-                for (i, (name, active)) in names.iter().enumerate() {
-                    let weak = weak.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(if i < 9 {
-                            format!("{name}    ⌃{}", i + 1)
-                        } else {
-                            name.clone()
-                        })
-                        .checked(*active)
-                        .on_click(move |_, window, cx| {
-                            let _ = weak.update(cx, |v, cx| v.activate_workspace(i, window, cx));
-                        }),
-                    );
+        let sort = self.prefs.sidebar_sort;
+        let folders = self.workspaces.iter().filter(|w| w.root.is_some()).count();
+        let any_open = self.workspaces.iter().any(|w| w.open);
+        div()
+            .pl_4()
+            .pr_2()
+            .pt_4()
+            .pb_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("WORKSPACES"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(
+                        Button::new("workspace-sort")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::ArrowDownUp))
+                            .disabled(folders < 2)
+                            .tooltip("Sort workspaces")
+                            .dropdown_menu(move |mut menu, _, _| {
+                                menu = menu.min_w(px(200.));
+                                for option in Sort::ALL {
+                                    let weak = weak.clone();
+                                    menu = menu.item(
+                                        PopupMenuItem::new(option.label())
+                                            .checked(option == sort)
+                                            .on_click(move |_, _, cx| {
+                                                let _ =
+                                                    weak.update(cx, |v, cx| v.set_sort(option, cx));
+                                            }),
+                                    );
+                                }
+                                menu
+                            }),
+                    )
+                    .child(
+                        Button::new("workspace-collapse")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::ChevronsDownUp))
+                            .disabled(!any_open)
+                            .tooltip("Collapse all")
+                            .on_click(cx.listener(|v, _, _, cx| v.collapse_all(cx))),
+                    )
+                    .child(
+                        Button::new("workspace-add")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Lucide::FolderPlus))
+                            .tooltip("Add folder · ⇧⌘O")
+                            .on_click(cx.listener(|v, _, w, cx| v.prompt(true, w, cx))),
+                    ),
+            )
+    }
+
+    /// Actions for one workspace, from its ⋯ button or a right-click.
+    fn workspace_menu(
+        menu: PopupMenu,
+        ws: usize,
+        folder: bool,
+        weak: WeakEntity<Self>,
+    ) -> PopupMenu {
+        let item =
+            |label: &'static str, f: fn(&mut Reader, usize, &mut Window, &mut Context<Reader>)| {
+                let weak = weak.clone();
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |v, cx| f(v, ws, window, cx));
+                })
+            };
+        let menu = if folder {
+            menu.item(item("Reveal in Finder", |v, ws, _, cx| {
+                if let Some(root) = &v.workspaces[ws].root {
+                    cx.reveal_path(root);
                 }
-                menu.separator()
-                    .menu("Add Folder…", Box::new(OpenFolder))
-                    .menu("Close Workspace", Box::new(CloseWorkspace))
-            })
+            }))
+            .item(item("Collapse Subfolders", |v, ws, _, cx| {
+                let ws = &mut v.workspaces[ws];
+                ws.expanded.clear();
+                ws.rebuild_rows();
+                v.save(cx);
+                cx.notify();
+            }))
+            .separator()
+        } else {
+            menu
+        };
+        menu.item(item("Close Workspace", |v, ws, w, cx| {
+            v.close_workspace(ws, w, cx)
+        }))
+    }
+
+    /// One sidebar row: a workspace's folder row, an entry in its tree, or
+    /// the placeholder under an empty folder.
+    fn sidebar_row(
+        &self,
+        item: Item,
+        ix: usize,
+        positions: &Rc<Vec<usize>>,
+        keyboard: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let (hover, accent, ring) = (theme.sidebar_accent, theme.sidebar_accent, theme.ring);
+        let muted = theme.muted_foreground;
+        let cursor = keyboard == Some(ix);
+        let current = self.focused_pane().read(cx).path.clone();
+        let row = div()
+            .h(px(SIDEBAR_ROW))
+            .w_full()
+            .pr_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .text_sm()
+            .border_1()
+            .border_color(if cursor { ring } else { transparent_black() });
+        match item {
+            Item::Header(w) => {
+                let ws = &self.workspaces[w];
+                let (active, open, folder) = (w == self.active, ws.open, ws.root.is_some());
+                let name: SharedString = ws.name().into();
+                let ghost = name.clone();
+                // A closed active workspace still says which file is showing.
+                let showing = (active && !open)
+                    .then(|| current.as_ref()?.file_name())
+                    .flatten()
+                    .map(|n| n.to_string_lossy().into_owned());
+                let docs = ws
+                    .tabs
+                    .tabs
+                    .iter()
+                    .filter(|t| t.panes().any(|p| p.read(cx).path.is_some()))
+                    .count();
+                let group: SharedString = format!("workspace-row-{w}").into();
+                let positions = positions.clone();
+                let target = positions[w];
+                let drag = theme.drag_border;
+                let (menu_weak, context_weak) = (cx.entity().downgrade(), cx.entity().downgrade());
+                row.id(("workspace", w))
+                    .group(group.clone())
+                    .pl_2()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .child(
+                        Icon::new(match (folder, open) {
+                            (false, _) => IconName::Inbox,
+                            (true, true) => IconName::FolderOpen,
+                            (true, false) => IconName::Folder,
+                        })
+                        .size_4()
+                        .flex_shrink_0()
+                        .text_color(if active {
+                            theme.primary
+                        } else {
+                            muted
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_baseline()
+                            .gap_1p5()
+                            .whitespace_nowrap()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .max_w(px(140.))
+                                    .truncate()
+                                    .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .child(name),
+                            )
+                            .when_some(showing, |d, file| {
+                                d.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(file),
+                                )
+                            }),
+                    )
+                    .when(!open && docs > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(docs.to_string()),
+                        )
+                    })
+                    .when(active, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(theme.primary),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("workspace-menu", w))
+                            .flex_shrink_0()
+                            .invisible()
+                            .group_hover(group, |s| s.visible())
+                            // Keep the click from also opening or closing the folder.
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new(("workspace-actions", w))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Ellipsis)
+                                    .dropdown_menu(move |menu, _, _| {
+                                        Self::workspace_menu(menu, w, folder, menu_weak.clone())
+                                    }),
+                            ),
+                    )
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        v.cursor = Some(Cursor { ws: w, path: None });
+                        v.toggle_open(w, cx);
+                    }))
+                    .when(folder, |d| {
+                        d.on_drag(DraggedWorkspace { ws: w }, move |_, _, _, cx| {
+                            cx.new(|_| Ghost(ghost.clone()))
+                        })
+                        .drag_over::<DraggedWorkspace>(move |style, dragged, _, _| {
+                            // A line on the side the dragged folder will land.
+                            let from = positions.get(dragged.ws).copied().unwrap_or(target);
+                            match from.cmp(&target) {
+                                std::cmp::Ordering::Less => style.border_b_2().border_color(drag),
+                                std::cmp::Ordering::Greater => {
+                                    style.border_t_2().border_color(drag)
+                                }
+                                std::cmp::Ordering::Equal => style,
+                            }
+                        })
+                        .on_drop(cx.listener(
+                            move |v, dragged: &DraggedWorkspace, _, cx| {
+                                v.move_workspace(dragged.ws, w, cx)
+                            },
+                        ))
+                    })
+                    .context_menu(move |menu, _, _| {
+                        Self::workspace_menu(menu, w, folder, context_weak.clone())
+                    })
+                    .into_any_element()
+            }
+            Item::Entry { ws, .. } => {
+                let Some(entry) = self.row(item) else {
+                    return div().id(("entry", ix)).into_any_element();
+                };
+                let selected = ws == self.active && current.as_ref() == Some(&entry.path);
+                let directory = entry.directory;
+                let icon = if !directory {
+                    IconName::FileText
+                } else if self.workspaces[ws].expanded.contains(&entry.path) {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                };
+                let path = entry.path.clone();
+                row.id(("entry", ix))
+                    .pl(px(22. + entry.depth as f32 * 14.))
+                    .cursor_pointer()
+                    .when(selected, |d| {
+                        d.bg(accent).text_color(theme.sidebar_accent_foreground)
+                    })
+                    .when(!selected, |d| d.hover(move |s| s.bg(hover)))
+                    .child(Icon::new(icon).size_4().flex_shrink_0().text_color(muted))
+                    .child(
+                        div().min_w_0().truncate().child(
+                            entry
+                                .path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                    )
+                    .on_click(cx.listener(move |v, e: &ClickEvent, w, cx| {
+                        let m = e.modifiers();
+                        let target = if m.platform {
+                            Target::NewTab
+                        } else if m.alt {
+                            Target::Split
+                        } else {
+                            Target::Focused
+                        };
+                        v.cursor = Some(Cursor {
+                            ws,
+                            path: Some(path.clone()),
+                        });
+                        v.tree_focus.focus(w, cx);
+                        v.tree_open(target, w, cx);
+                    }))
+                    .into_any_element()
+            }
+            Item::Empty(ws) => {
+                let ws = &self.workspaces[ws];
+                row.id(("empty", ix))
+                    .pl(px(46.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if ws.indexing || !ws.scanned {
+                        "Finding Markdown files…"
+                    } else {
+                        "No Markdown files"
+                    })
+                    .into_any_element()
+            }
+        }
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ws = self.ws();
-        let current = self.focused_pane().read(cx).path.clone();
+        let items = Rc::new(self.layout());
+        let mut positions = vec![0; self.workspaces.len()];
+        for (p, &w) in self.order().iter().enumerate() {
+            positions[w] = p;
+        }
+        let positions = Rc::new(positions);
         div()
             .id("folder-pane")
             .key_context("MarkdownTree")
@@ -1094,108 +1786,54 @@ impl Reader {
             .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
                 this.drop_anywhere(dragged.paths(), window, cx)
             }))
-            .child(
-                div()
-                    .px_4()
-                    .pt_5()
-                    .pb_3()
-                    .flex()
-                    .justify_between()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
-                    .child("WORKSPACE")
-                    .when(self.workspaces.len() > 1, |d| {
-                        d.child(format!("{} of {}", self.active + 1, self.workspaces.len()))
-                    }),
-            )
-            .child(div().px_1().pb_3().child(self.workspace_switcher(cx)))
-            .child(
-                uniform_list(
-                    "file-tree",
-                    ws.rows.len(),
-                    cx.processor(move |this, range: Range<usize>, _, cx| {
-                        let ws = this.ws();
-                        range
-                            .map(|index| {
-                                let row = &ws.rows[index];
-                                let directory = row.directory;
-                                let current = if directory {
-                                    ws.selected == index
-                                } else {
-                                    current.as_ref() == Some(&row.path)
-                                };
-                                div()
-                                    .id(("file", index))
-                                    .h(px(32.))
-                                    .pl(px(12. + row.depth as f32 * 14.))
-                                    .pr_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .bg(if current {
-                                        cx.theme().accent
-                                    } else {
-                                        cx.theme().sidebar
-                                    })
-                                    .child(
-                                        Icon::new(if directory {
-                                            if ws.expanded.contains(&row.path) {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            }
-                                        } else {
-                                            IconName::FileText
-                                        })
-                                        .size_4()
-                                        .text_color(cx.theme().muted_foreground),
-                                    )
-                                    .child(
-                                        div().overflow_hidden().whitespace_nowrap().child(
-                                            row.path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .into_owned(),
-                                        ),
-                                    )
-                                    .on_click(cx.listener(move |v, e: &ClickEvent, w, cx| {
-                                        let m = e.modifiers();
-                                        let target = if m.platform {
-                                            Target::NewTab
-                                        } else if m.alt {
-                                            Target::Split
-                                        } else {
-                                            Target::Focused
-                                        };
-                                        v.ws_mut().selected = index;
-                                        v.tree_focus.focus(w, cx);
-                                        v.tree_open(target, w, cx);
-                                    }))
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&ws.tree_scroll)
-                .flex_1(),
-            )
-            .when(ws.rows.is_empty(), |d| {
+            .child(self.sidebar_header(cx))
+            .when(items.is_empty(), |d| {
                 d.child(
                     div()
+                        .flex_1()
                         .px_4()
-                        .py_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap_3()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if ws.indexing {
-                            "Finding Markdown files…"
-                        } else if ws.root.is_none() {
-                            "Open a folder to browse its Markdown files."
-                        } else {
-                            "No Markdown files in this folder."
+                        .child("Add a folder to browse its Markdown files. Each folder keeps its own tabs.")
+                        .child(
+                            Button::new("empty-add-folder")
+                                .small()
+                                .icon(IconName::FolderOpen)
+                                .label("Add Folder…")
+                                .on_click(cx.listener(|v, _, w, cx| v.prompt(true, w, cx))),
+                        ),
+                )
+            })
+            .when(!items.is_empty(), |d| {
+                d.child(
+                    uniform_list(
+                        "workspace-tree",
+                        items.len(),
+                        cx.processor(move |this, range: Range<usize>, window, cx| {
+                            // While the sidebar has focus, ring the keyboard's row.
+                            let keyboard = this
+                                .tree_focus
+                                .is_focused(window)
+                                .then(|| this.cursor_index(&items, cx))
+                                .flatten();
+                            range
+                                .map(|ix| {
+                                    div()
+                                        .w_full()
+                                        .px_1()
+                                        .child(this.sidebar_row(items[ix], ix, &positions, keyboard, cx))
+                                })
+                                .collect::<Vec<_>>()
                         }),
+                    )
+                    .track_scroll(&self.tree_scroll)
+                    .pb_2()
+                    .flex_1(),
                 )
             })
             .child(
@@ -1206,13 +1844,19 @@ impl Reader {
                     .border_color(cx.theme().border)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
+                    .truncate()
                     .child(if ws.indexing {
-                        "Indexing…".to_owned()
+                        format!("{} · Indexing…", ws.name())
                     } else if ws.root.is_none() {
-                        "Loose files".to_owned()
+                        match ws.rows.len() {
+                            0 => "No folder open".to_owned(),
+                            1 => "1 open file".to_owned(),
+                            n => format!("{n} open files"),
+                        }
                     } else {
                         format!(
-                            "{} Markdown files{}",
+                            "{} · {} Markdown files{}",
+                            ws.name(),
                             ws.files.len(),
                             if ws.limited { " · limit reached" } else { "" }
                         )
@@ -1824,6 +2468,13 @@ impl Reader {
                     }
                 }
                 "workspace" => self.add_folder(PathBuf::from(arg), window, cx),
+                "switch" => self.switch_to_nth(arg.parse().unwrap_or(0), window, cx),
+                "collapse" => {
+                    if let Some(&ws) = self.order().get(arg.parse().unwrap_or(0)) {
+                        self.toggle_open(ws, cx);
+                    }
+                }
+                "sidebar-focus" => self.tree_focus.focus(window, cx),
                 "tab" => {
                     if let Some(path) = resolve(&self.ws().root.clone().or(base.clone()), arg) {
                         self.open_in(path, Target::NewTab, window, cx);
@@ -1960,9 +2611,7 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &ToggleSplit, w, cx| v.toggle_split(w, cx)))
             .on_action(cx.listener(|v, _: &FocusLeftPane, w, cx| v.focus_pane(false, w, cx)))
             .on_action(cx.listener(|v, _: &FocusRightPane, w, cx| v.focus_pane(true, w, cx)))
-            .on_action(
-                cx.listener(|v, a: &SwitchWorkspace, w, cx| v.activate_workspace(a.index, w, cx)),
-            )
+            .on_action(cx.listener(|v, a: &SwitchWorkspace, w, cx| v.switch_to_nth(a.index, w, cx)))
             .on_action(cx.listener(|v, _: &NextWorkspace, w, cx| v.cycle_workspace(1, w, cx)))
             .on_action(cx.listener(|v, _: &PrevWorkspace, w, cx| v.cycle_workspace(-1, w, cx)))
             .on_action(
@@ -1971,29 +2620,8 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &TreeUp, w, cx| v.tree_move(-1, w, cx)))
             .on_action(cx.listener(|v, _: &TreeDown, w, cx| v.tree_move(1, w, cx)))
             .on_action(cx.listener(|v, _: &TreeOpen, w, cx| v.tree_open(Target::Focused, w, cx)))
-            .on_action(cx.listener(|v, _: &TreeLeft, _, cx| {
-                let ws = v.ws_mut();
-                if let Some(row) = ws.rows.get(ws.selected).cloned() {
-                    if ws.expanded.remove(&row.path) {
-                        ws.rebuild_rows();
-                    } else if let Some(parent) = row.path.parent()
-                        && let Some(index) = ws.rows.iter().position(|r| r.path == parent)
-                    {
-                        ws.selected = index;
-                    }
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|v, _: &TreeRight, w, cx| {
-                let ws = v.ws();
-                if let Some(row) = ws.rows.get(ws.selected) {
-                    if row.directory && !ws.expanded.contains(&row.path) {
-                        v.tree_open(Target::Focused, w, cx);
-                    } else {
-                        v.tree_move(1, w, cx);
-                    }
-                }
-            }))
+            .on_action(cx.listener(|v, _: &TreeLeft, _, cx| v.tree_left(cx)))
+            .on_action(cx.listener(|v, _: &TreeRight, w, cx| v.tree_right(w, cx)))
             .child(self.toolbar(window, cx))
             .child(
                 div()
@@ -2352,6 +2980,166 @@ mod tests {
         let saved = view.read_with(cx, |v, _| v.prefs.workspaces.clone());
         assert_eq!(saved.len(), 3);
         assert_eq!(saved[0].tabs[0].left.path, Some(one.path().join("One.md")));
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_folders_open_close_and_reorder_without_switching(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (alpha, zeta) = (tmp.path().join("alpha"), tmp.path().join("zeta"));
+        for (dir, names) in [(&zeta, &["z1.md", "z2.md"][..]), (&alpha, &["a.md"][..])] {
+            std::fs::create_dir(dir).unwrap();
+            for name in names {
+                std::fs::write(dir.join(name), "# Doc").unwrap();
+            }
+        }
+        let (w, view) = open(cx);
+        // Added zeta first, so manual order is zeta, alpha; alpha is active.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(zeta.clone(), w, cx);
+            v.add_folder(alpha.clone(), w, cx);
+        });
+        let roots = |view: &Entity<Reader>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| {
+                v.order()
+                    .into_iter()
+                    .map(|i| v.workspaces[i].name())
+                    .collect::<Vec<_>>()
+            })
+        };
+        let active = |view: &Entity<Reader>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| v.ws().name())
+        };
+        assert_eq!(roots(&view, cx), ["zeta", "alpha"]);
+        assert_eq!(active(&view, cx), "alpha");
+        assert_eq!(view.read_with(cx, |v, _| v.layout().len()), 5, "both open");
+
+        // Closing and reopening a folder never switches workspaces.
+        with_reader(w, &view, cx, |v, _, cx| v.toggle_open(0, cx));
+        assert_eq!(view.read_with(cx, |v, _| v.layout().len()), 3);
+        assert_eq!(active(&view, cx), "alpha");
+        with_reader(w, &view, cx, |v, _, cx| v.toggle_open(0, cx));
+
+        // The keyboard crosses workspaces; ↑ onto another workspace's file
+        // only moves the cursor, ↵ opens it there.
+        interact(w, cx, |w, cx| {
+            w.press("cmd-1", cx);
+            w.press("up", cx);
+        });
+        assert_eq!(active(&view, cx), "alpha");
+        assert!(pane(&view, cx, |p| p.is_blank()));
+        interact(w, cx, |w, cx| w.press("enter", cx));
+        assert_eq!(active(&view, cx), "zeta");
+        assert_eq!(pane(&view, cx, |p| p.title()), "z2.md");
+
+        // ← on a file goes up to its folder row, and ← again closes it.
+        interact(w, cx, |w, cx| {
+            w.press("left", cx);
+            w.press("left", cx);
+        });
+        assert!(view.read_with(cx, |v, _| !v.ws().open));
+        assert_eq!(active(&view, cx), "zeta");
+
+        // Dragging alpha onto zeta reorders, keeping the active workspace.
+        with_reader(w, &view, cx, |v, _, cx| v.move_workspace(1, 0, cx));
+        assert_eq!(roots(&view, cx), ["alpha", "zeta"]);
+        assert_eq!(active(&view, cx), "zeta");
+
+        // Sorting by recent use puts zeta first, and ⌃1 follows the sidebar.
+        with_reader(w, &view, cx, |v, _, cx| v.set_sort(Sort::Recent, cx));
+        assert_eq!(roots(&view, cx), ["zeta", "alpha"]);
+        interact(w, cx, |w, cx| w.press("ctrl-2", cx));
+        assert_eq!(active(&view, cx), "alpha");
+        assert_eq!(roots(&view, cx), ["alpha", "zeta"]);
+
+        // Collapse all keeps the active workspace open; again closes it too.
+        with_reader(w, &view, cx, |v, _, cx| {
+            for ws in &mut v.workspaces {
+                ws.open = true;
+            }
+            v.collapse_all(cx);
+        });
+        let open = |view: &Entity<Reader>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, _| {
+                v.workspaces
+                    .iter()
+                    .filter(|w| w.open)
+                    .map(|w| w.name())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(open(&view, cx), ["alpha"]);
+        with_reader(w, &view, cx, |v, _, cx| v.collapse_all(cx));
+        assert!(open(&view, cx).is_empty());
+
+        let saved = view.read_with(cx, |v, _| v.prefs.clone());
+        assert!(
+            saved
+                .workspaces
+                .iter()
+                .all(|w| w.collapsed && w.last_used > 0)
+        );
+        assert_eq!(saved.sidebar_sort, Sort::Recent);
+    }
+
+    #[gpui_kit::test]
+    fn open_inactive_workspaces_are_watched_and_rescanned(cx: &mut TestAppContext) {
+        let one = folder(&[("One.md", "# One")]);
+        let two = folder(&[("Two.md", "# Two")]);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(one.path().into(), w, cx);
+            v.add_folder(two.path().into(), w, cx);
+        });
+        let watched = view.read_with(cx, |v, _| v.watched.len());
+        assert_eq!(watched, 2, "both open folders");
+        let added = one.path().join("Added.md");
+        std::fs::write(&added, "# Added").unwrap();
+        with_reader(w, &view, cx, |v, _, cx| v.files_changed(&[added], cx));
+        assert_eq!(view.read_with(cx, |v, _| v.workspaces[0].files.len()), 2);
+        assert_eq!(view.read_with(cx, |v, _| v.active), 1, "still on two");
+
+        // A closed, inactive folder stops being watched.
+        with_reader(w, &view, cx, |v, _, cx| v.toggle_open(0, cx));
+        assert_eq!(view.read_with(cx, |v, _| v.watched.len()), 1);
+    }
+
+    #[gpui_kit::test]
+    fn loose_files_list_their_open_documents(cx: &mut TestAppContext) {
+        let tmp = folder(&[("A.md", "# A"), ("B.md", "# B")]);
+        let (w, view) = open(cx);
+        assert!(
+            view.read_with(cx, |v, _| v.layout().is_empty()),
+            "empty state"
+        );
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_path(tmp.path().join("A.md"), w, cx);
+            v.open_path(tmp.path().join("B.md"), w, cx);
+        });
+        let names = view.read_with(cx, |v, _| {
+            v.layout()
+                .into_iter()
+                .map(|i| match i {
+                    Item::Header(ws) => v.workspaces[ws].name(),
+                    item => v
+                        .row(item)
+                        .unwrap()
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into(),
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(names, ["Open Files", "A.md", "B.md"]);
+        // Clicking an open document goes to its tab.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(v.active, tmp.path().join("A.md"), Target::Focused, w, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| (v.ws().tabs.len(), v.ws().tabs.active)),
+            (2, 0)
+        );
     }
 
     #[gpui_kit::test]

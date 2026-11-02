@@ -7,7 +7,8 @@ All notable changes to Markdown Viewer are documented here. The format follows [
 Planned for 0.2.0.
 
 ### Added
-- **Workspaces.** Each added folder becomes a workspace with its own file tree and tabs. Switch from the sidebar header menu, with ⌃1–9, or with ⌃⌘[ / ⌃⌘]. Files opened from Finder go to the workspace whose folder contains them, or to a "Files" workspace.
+- **Workspaces.** Each added folder becomes a workspace with its own file tree and tabs. The sidebar lists every workspace as a folder you can open and close, so several projects can be browsed at once. Opening a folder never switches workspaces; opening a file in one makes it active and shows its tabs. The active workspace is marked with a dot, and when closed it still shows the current file name and its number of open tabs. Switch with ⌃1–9 (in sidebar order) or ⌃⌘[ / ⌃⌘]. Files opened from Finder go to the workspace whose folder contains them, or to "Open Files", which lists them.
+- **Organizing the sidebar.** Drag folders to reorder them, or sort by name or recent use. Collapse All closes every workspace but the active one (press it again to close that too). Each folder's ⋯ / right-click menu has Reveal in Finder, Collapse Subfolders and Close Workspace. The arrow keys move across all open workspaces: ← closes a folder or goes to its parent, → opens it, ↵ opens a file in its workspace.
 - **Tabs.** ⌘T opens a new tab, ⌘W closes a pane or tab, ⇧⌘T reopens the last closed one, and ⌃Tab / ⇧⌘] / ⇧⌘[ switch tabs. Tabs can be pinned, reordered by dragging, and closed from a context menu. The tab strip only shows when a workspace has more than one tab.
 - **Side-by-side split.** ⌘\ shows a document twice, or separates a split back into two tabs. Drag a tab onto the left or right half of the page to read it beside the current one, and drag a pane header to the tab bar to separate it again. Splits stop at two panes. In narrow windows a split shows one pane at a time with a switcher.
 - **Drag from Finder.** Drop a Markdown file on the left or right half of the page to open it in that pane, splitting the tab if needed. Drop two files on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs, and folders dropped on the sidebar (or anywhere else) become workspaces.
@@ -17,7 +18,7 @@ Planned for 0.2.0.
 ### Changed
 - ⌘W now closes the focused pane or tab. Close Window moved to ⇧⌘W.
 - "Open Folder…" is now "Add Folder Workspace…". Settings saved by 0.1 (one folder and one file) are migrated into a single workspace.
-- Only the active workspace's folder is watched. Other workspaces rescan when you switch to them.
+- The folders of the active workspace and of every workspace open in the sidebar are watched for changes. Closed workspaces rescan when they are opened again.
 
 ## [0.1.0] - 2026-10-27
 
