@@ -1,7 +1,10 @@
 mod actions;
 mod files;
+mod pane;
 mod preferences;
 mod reader;
+mod tabs;
+mod workspace;
 
 use actions::*;
 use gpui_kit::{base::Root, component::TitleBar, *};
@@ -15,12 +18,14 @@ fn open(path: Option<PathBuf>, cx: &mut App) {
     let existing = cx.global::<MainWindow>();
     if let (Some(handle), Some(view)) = (existing.0, existing.1.clone())
         && handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                if let Some(path) = path.clone() {
+                    view.update(cx, |v, cx| v.open_path(path, window, cx));
+                }
+            })
             .is_ok()
     {
-        if let Some(path) = path {
-            view.update(cx, |v, cx| v.open_path(path, cx));
-        }
         return;
     }
     let options = WindowOptions {

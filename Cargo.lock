@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "markdown-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -3988,7 +3988,7 @@ dependencies = [
 
 [[package]]
 name = "markdown-viewer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "gpui-kit",

@@ -30,7 +30,20 @@ actions!(
         TreeDown,
         TreeLeft,
         TreeRight,
-        TreeOpen
+        TreeOpen,
+        NewTab,
+        CloseTab,
+        ReopenClosedTab,
+        NextTab,
+        PrevTab,
+        ToggleSplit,
+        FocusLeftPane,
+        FocusRightPane,
+        OpenInNewTab,
+        OpenInSplit,
+        CloseWorkspace,
+        NextWorkspace,
+        PrevWorkspace
     ]
 );
 
@@ -38,6 +51,11 @@ actions!(
 #[action(namespace = markdown_viewer, no_json)]
 pub struct OpenPath {
     pub path: std::path::PathBuf,
+}
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = markdown_viewer, no_json)]
+pub struct SwitchWorkspace {
+    pub index: usize,
 }
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = markdown_viewer, no_json)]
@@ -70,7 +88,23 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-[", Back, None),
         KeyBinding::new("cmd-]", Forward, None),
         KeyBinding::new("cmd-r", Reload, None),
-        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-w", CloseWindow, None),
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PrevTab, None),
+        KeyBinding::new("cmd-}", NextTab, None),
+        KeyBinding::new("cmd-{", PrevTab, None),
+        KeyBinding::new("cmd-\\", ToggleSplit, None),
+        KeyBinding::new("cmd-alt-left", FocusLeftPane, None),
+        KeyBinding::new("cmd-alt-right", FocusRightPane, None),
+        KeyBinding::new("ctrl-cmd-]", NextWorkspace, None),
+        KeyBinding::new("ctrl-cmd-[", PrevWorkspace, None),
+        KeyBinding::new("cmd-enter", OpenInNewTab, Some("Command")),
+        KeyBinding::new("alt-enter", OpenInSplit, Some("Command")),
         KeyBinding::new("cmd-ctrl-f", FullScreen, None),
         KeyBinding::new("cmd-/", Help, None),
         KeyBinding::new("escape", Escape, Some("Viewer")),
@@ -80,7 +114,16 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("right", TreeRight, Some("MarkdownTree")),
         KeyBinding::new("enter", TreeOpen, Some("MarkdownTree")),
         KeyBinding::new("space", FocusReader, Some("MarkdownTree")),
+        KeyBinding::new("cmd-enter", OpenInNewTab, Some("MarkdownTree")),
+        KeyBinding::new("alt-enter", OpenInSplit, Some("MarkdownTree")),
     ]);
+    cx.bind_keys((0..9).map(|index| {
+        KeyBinding::new(
+            &format!("ctrl-{}", index + 1),
+            SwitchWorkspace { index },
+            None,
+        )
+    }));
     cx.set_menus([
         Menu::new("Markdown Viewer").items([
             MenuItem::action("Keyboard Shortcuts & Setup", Help),
@@ -89,10 +132,15 @@ pub fn bind(cx: &mut App) {
         ]),
         Menu::new("File").items([
             MenuItem::action("Open Markdown…", OpenFile),
-            MenuItem::action("Open Folder…", OpenFolder),
+            MenuItem::action("Add Folder Workspace…", OpenFolder),
             MenuItem::action("Quick Open…", QuickOpen),
             MenuItem::separator(),
+            MenuItem::action("New Tab", NewTab),
+            MenuItem::action("Reopen Closed Tab", ReopenClosedTab),
+            MenuItem::separator(),
             MenuItem::action("Reload", Reload),
+            MenuItem::action("Close Tab", CloseTab),
+            MenuItem::action("Close Workspace", CloseWorkspace),
             MenuItem::action("Close Window", CloseWindow),
         ]),
         Menu::new("Edit").items([
@@ -118,6 +166,16 @@ pub fn bind(cx: &mut App) {
         Menu::new("Go").items([
             MenuItem::action("Back", Back),
             MenuItem::action("Forward", Forward),
+            MenuItem::separator(),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::action("Previous Tab", PrevTab),
+            MenuItem::action("Next Workspace", NextWorkspace),
+            MenuItem::action("Previous Workspace", PrevWorkspace),
+        ]),
+        Menu::new("Window").items([
+            MenuItem::action("Split Side by Side", ToggleSplit),
+            MenuItem::action("Focus Left Pane", FocusLeftPane),
+            MenuItem::action("Focus Right Pane", FocusRightPane),
         ]),
     ]);
 }

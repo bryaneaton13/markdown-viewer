@@ -1,65 +1,95 @@
-use crate::{actions::*, files, preferences::Preferences};
+//! The window: title-bar toolbar, workspace sidebar, tab strip, and one or
+//! two document panes side by side. Document state lives in `DocPane`; this
+//! view routes actions to the focused pane and owns workspaces and tabs.
+
+use crate::{
+    actions::*,
+    files,
+    pane::{DocPane, FontSize, PaneEvent},
+    preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
+    tabs::{Tab, TabSet},
+    workspace::{Workspace, home_for},
+};
 use gpui_kit::{
-    base::{
-        TextView, TextViewState,
-        text::{RangeHighlight, RenderedText},
-    },
     component::{
         button::*,
         command::{Command, CommandGroup, CommandItem, CommandState},
-        input::{Input, InputEvent, InputState},
+        menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+        resizable::{ResizableState, h_resizable, resizable_panel},
         *,
     },
     prelude::FluentBuilder,
     *,
 };
-use markdown_core::{Document, Link};
 use notify::Watcher;
-use std::{collections::HashSet, ops::Range, path::PathBuf, time::Duration};
+use std::{
+    collections::HashSet,
+    ffi::OsString,
+    ops::Range,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const TOOLBAR_HEIGHT: f32 = 44.;
-const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
-const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Browse a folder\n- **⌘P** — Jump to a file\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
-const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / folder |\n| ⌘P / ⌘K | Quick Open |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| Escape | Dismiss picker, find, or help |\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Prototype scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels. One document at a time with back/forward history. Mermaid stays visible as code. Remote images are not fetched.\n";
+const SIDEBAR_WIDTH: f32 = 242.;
+/// Below this content width a split tab shows one pane at a time.
+const SPLIT_MIN_WIDTH: f32 = 720.;
+
+/// Where a file opens.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Target {
+    /// Replace the focused pane's document.
+    Focused,
+    /// A new tab beside the active one.
+    NewTab,
+    /// The other pane of the active tab, splitting it first if needed.
+    Split,
+}
+
+/// Payload while a tab is dragged.
+#[derive(Clone)]
+struct DraggedTab {
+    from: usize,
+}
+
+/// Payload while a pane header is dragged out to the tab strip.
+#[derive(Clone)]
+struct DraggedPane {
+    right: bool,
+}
+
+/// The floating label that follows the pointer during a drag.
+struct Ghost(SharedString);
+impl Render for Ghost {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .text_sm()
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            .child(self.0.clone())
+    }
+}
 
 pub struct Reader {
     prefs: Preferences,
     focus: FocusHandle,
     tree_focus: FocusHandle,
-    text: Entity<TextViewState>,
-    find_input: Entity<InputState>,
     palette: Entity<CommandState>,
-    pub path: Option<PathBuf>,
-    document: Option<Document>,
-    root: Option<PathBuf>,
-    files: Vec<PathBuf>,
-    rows: Vec<files::Row>,
-    expanded: HashSet<PathBuf>,
-    selected: usize,
-    tree_scroll: UniformListScrollHandle,
-    source: bool,
-    copied: bool,
-    properties: bool,
-    help: bool,
-    find: bool,
+    workspaces: Vec<Workspace>,
+    active: usize,
     picker: Option<bool>, // false: files, true: headings
-    matches: Vec<Range<usize>>,
-    match_index: usize,
-    searched: Option<RenderedText>,
-    pending_anchor: Option<String>,
-    history: Vec<PathBuf>,
-    history_index: usize,
-    loading: bool,
-    indexing: bool,
-    limited: bool,
-    error: Option<String>,
-    generation: usize,
-    folder_generation: usize,
-    _load: Option<Task<()>>,
-    _scan: Option<Task<()>>,
+    split_state: Entity<ResizableState>,
+    /// While a tab is dragged over the panes: the half it would land in.
+    drop_zone: Option<bool>,
+    watched: Vec<(PathBuf, bool)>,
     _watch: Option<notify::RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
-    _subscriptions: Vec<Subscription>,
 }
 
 impl Reader {
@@ -76,127 +106,419 @@ impl Reader {
                 cx,
             );
         }
-        let text = cx.new(|cx| {
-            TextViewState::markdown(WELCOME, cx)
-                .selectable(true)
-                .scrollable(true)
-        });
-        let find_input = cx.new(|cx| InputState::new(window, cx).placeholder("Find in document…"));
-        let palette = cx.new(|cx| CommandState::new(window, cx));
-        let observation = cx.observe(&text, |this, _, cx| {
-            let snapshot = this.text.read(cx).rendered_text();
-            if this.searched.as_ref() != Some(&snapshot) {
-                this.searched = Some(snapshot);
-                if this.find {
-                    this.update_find(cx);
-                }
-                if let Some(anchor) = this.pending_anchor.take() {
-                    this.jump_anchor(&anchor, cx);
-                }
-            }
-            cx.notify();
-        });
-        let input_subscription = cx.subscribe(&find_input, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.match_index = 0;
-                this.update_find(cx);
-            }
-        });
+        cx.set_global(FontSize(prefs.font_size));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut this = Self {
-            prefs,
             focus,
             tree_focus: cx.focus_handle(),
-            text,
-            find_input,
-            palette,
-            path: None,
-            document: None,
-            root: None,
-            files: Vec::new(),
-            rows: Vec::new(),
-            expanded: HashSet::new(),
-            selected: 0,
-            tree_scroll: UniformListScrollHandle::new(),
-            source: false,
-            copied: false,
-            properties: false,
-            help: false,
-            find: false,
+            palette: cx.new(|cx| CommandState::new(window, cx)),
+            workspaces: Vec::new(),
+            active: 0,
             picker: None,
-            matches: Vec::new(),
-            match_index: 0,
-            searched: None,
-            pending_anchor: None,
-            history: Vec::new(),
-            history_index: 0,
-            loading: false,
-            indexing: false,
-            limited: false,
-            error: None,
-            generation: 0,
-            folder_generation: 0,
-            _load: None,
-            _scan: None,
+            split_state: cx.new(|_| ResizableState::default()),
+            drop_zone: None,
+            watched: Vec::new(),
             _watch: None,
             _watch_task: None,
-            _subscriptions: vec![observation, input_subscription],
+            prefs,
         };
+        let saved = std::mem::take(&mut this.prefs.workspaces);
+        for ws in &saved {
+            if ws.root.as_ref().is_some_and(|r| !r.is_dir())
+                || this.workspaces.iter().any(|w| w.root == ws.root)
+            {
+                continue;
+            }
+            let tabs = ws
+                .tabs
+                .iter()
+                .map(|t| {
+                    let mut tab = Tab::new(Self::make_pane(Some(&t.left), window, cx));
+                    tab.right = t
+                        .right
+                        .as_ref()
+                        .map(|r| Self::make_pane(Some(r), window, cx));
+                    tab.focus_right = t.focus_right && tab.right.is_some();
+                    tab.pinned = t.pinned;
+                    tab
+                })
+                .collect();
+            let tabs = TabSet::restore(tabs, ws.active_tab, || Self::make_pane(None, window, cx));
+            let mut workspace = Workspace::new(ws.root.clone(), tabs);
+            workspace.expanded = ws.expanded.iter().cloned().collect();
+            this.workspaces.push(workspace);
+        }
+        if this.workspaces.is_empty() {
+            this.push_workspace(None, window, cx);
+        }
+        this.active = this.prefs.active_workspace.min(this.workspaces.len() - 1);
+        this.scan(this.active, cx);
+        this.rewatch(cx);
         if let Some(path) = path {
-            this.open_path(path, cx);
-        } else {
-            if let Some(folder) = this.prefs.folder.clone().filter(|p| p.is_dir()) {
-                this.open_folder(folder, cx);
-            }
-            if let Some(file) = this.prefs.file.clone().filter(|p| p.is_file()) {
-                this.load_file(file, true, cx);
-            }
+            this.open_path(path, window, cx);
         }
         this
     }
 
-    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn make_pane(
+        saved: Option<&SavedPane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DocPane> {
+        let pane = cx.new(|cx| match saved {
+            Some(saved) => DocPane::restore(saved, window, cx),
+            None => DocPane::new(window, cx),
+        });
+        cx.subscribe(&pane, |this, _, _: &PaneEvent, cx| this.pane_changed(cx))
+            .detach();
+        pane
+    }
+
+    fn pane_changed(&mut self, cx: &mut Context<Self>) {
+        self.rewatch(cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    // MARK: Accessors
+
+    fn ws(&self) -> &Workspace {
+        &self.workspaces[self.active]
+    }
+
+    fn ws_mut(&mut self) -> &mut Workspace {
+        &mut self.workspaces[self.active]
+    }
+
+    fn tab(&self) -> &Tab<Entity<DocPane>> {
+        self.ws().tabs.active()
+    }
+
+    /// The pane navigation and the toolbar apply to.
+    pub fn focused_pane(&self) -> Entity<DocPane> {
+        self.tab().focused().clone()
+    }
+
+    fn with_pane<R>(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DocPane, &mut Context<DocPane>) -> R,
+    ) -> R {
+        self.focused_pane().update(cx, f)
+    }
+
+    // MARK: Opening
+
+    /// Open from Finder, the command line, or the Open panel: a folder
+    /// becomes a workspace; a file opens in the workspace it belongs to.
+    pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = if path.is_absolute() {
             path
         } else {
             std::env::current_dir().unwrap_or_default().join(path)
         };
         if path.is_dir() {
-            self.open_folder(path, cx);
+            self.add_folder(path, window, cx);
         } else {
-            self.load_file(path, true, cx);
+            self.open_file(path, window, cx);
         }
     }
 
-    fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.root = Some(path.clone());
-        self.prefs.folder = Some(path);
-        self.prefs.sidebar = true;
-        self.expanded.clear();
-        self.scan(cx);
-        self.watch(cx);
-        self.prefs.save();
+    fn push_workspace(
+        &mut self,
+        root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tabs = TabSet::new(Tab::new(Self::make_pane(None, window, cx)));
+        self.workspaces.push(Workspace::new(root, tabs));
     }
 
-    fn scan(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.root.clone() else {
+    /// Add a folder as a workspace and switch to it. A loose-files workspace
+    /// whose documents all live in that folder is adopted instead.
+    fn add_folder(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefs.sidebar = true;
+        if let Some(ix) = self
+            .workspaces
+            .iter()
+            .position(|w| w.root.as_ref() == Some(&path))
+        {
+            self.activate_workspace(ix, window, cx);
+            return;
+        }
+        let adopt = self.ws().root.is_none()
+            && self.ws().tabs.panes().all(|p| {
+                p.read(cx)
+                    .path
+                    .as_ref()
+                    .is_none_or(|f| f.starts_with(&path))
+            });
+        if adopt {
+            let ws = self.ws_mut();
+            ws.root = Some(path);
+            ws.expanded.clear();
+            ws.scanned = false;
+        } else {
+            self.push_workspace(Some(path), window, cx);
+            self.active = self.workspaces.len() - 1;
+        }
+        self.after_workspace_change(window, cx);
+    }
+
+    /// Open a file in its workspace: switch to a tab already showing it, use
+    /// an empty focused pane, or open a new tab.
+    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let roots: Vec<_> = self.workspaces.iter().map(|w| w.root.as_deref()).collect();
+        let ix = match home_for(&roots, &path) {
+            Some(ix) => ix,
+            None => {
+                self.push_workspace(None, window, cx);
+                self.workspaces.len() - 1
+            }
+        };
+        if ix != self.active {
+            self.active = ix;
+            self.after_workspace_change(window, cx);
+        }
+        let showing = self.ws().tabs.tabs.iter().enumerate().find_map(|(i, t)| {
+            let right = t
+                .panes()
+                .position(|p| p.read(cx).path.as_ref() == Some(&path))?;
+            Some((i, right == 1))
+        });
+        if let Some((tab, right)) = showing {
+            let tabs = &mut self.ws_mut().tabs;
+            tabs.activate(tab);
+            tabs.active_mut().focus_right = right;
+            self.after_tab_change(window, cx);
+        } else if self.focused_pane().read(cx).is_blank() {
+            self.open_in(path, Target::Focused, window, cx);
+        } else {
+            self.open_in(path, Target::NewTab, window, cx);
+        }
+    }
+
+    /// Open a file from the tree or Quick Open.
+    pub fn open_in(
+        &mut self,
+        path: PathBuf,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let load = |pane: &Entity<DocPane>, cx: &mut Context<Self>| {
+            pane.update(cx, |p, cx| p.load_file(path.clone(), true, cx))
+        };
+        match target {
+            Target::Focused => load(&self.focused_pane(), cx),
+            Target::NewTab => {
+                let pane = Self::make_pane(None, window, cx);
+                load(&pane, cx);
+                self.ws_mut().tabs.insert_after_active(Tab::new(pane));
+                self.after_tab_change(window, cx);
+            }
+            Target::Split => {
+                if self.tab().is_split() {
+                    let tab = self.ws_mut().tabs.active_mut();
+                    tab.focus_right = !tab.focus_right;
+                    load(&self.focused_pane(), cx);
+                } else {
+                    let pane = Self::make_pane(None, window, cx);
+                    load(&pane, cx);
+                    self.ws_mut().tabs.active_mut().split_with(pane, true);
+                }
+                self.after_tab_change(window, cx);
+            }
+        }
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn prompt(&mut self, folder: bool, window: &Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: !folder,
+            directories: folder,
+            multiple: false,
+            prompt: Some(
+                if folder {
+                    "Add Folder"
+                } else {
+                    "Open Markdown"
+                }
+                .into(),
+            ),
+        });
+        let window = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = window.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.open_path(path, window, cx))
+                });
+            }
+        })
+        .detach();
+    }
+
+    // MARK: Workspaces
+
+    fn activate_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.workspaces.len() && ix != self.active {
+            self.active = ix;
+            self.after_workspace_change(window, cx);
+        }
+    }
+
+    fn cycle_workspace(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.workspaces.len() as isize;
+        let ix = (self.active as isize + delta).rem_euclid(n) as usize;
+        self.activate_workspace(ix, window, cx);
+    }
+
+    fn close_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.workspaces.len() {
+            return;
+        }
+        self.workspaces.remove(ix);
+        if self.workspaces.is_empty() {
+            self.push_workspace(None, window, cx);
+        }
+        if self.active > ix || self.active >= self.workspaces.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.after_workspace_change(window, cx);
+    }
+
+    fn after_workspace_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = None;
+        self.drop_zone = None;
+        // Files may have changed while the folder wasn't watched.
+        self.scan(self.active, cx);
+        self.rewatch(cx);
+        self.after_tab_change(window, cx);
+    }
+
+    // MARK: Tabs and panes
+
+    /// Keep keyboard focus inside the visible content after tabs or panes
+    /// change, so window actions keep reaching this view.
+    fn after_tab_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tree_focus.is_focused(window) {
+            self.focus_reader(window, cx);
+        }
+        self.save(cx);
+        cx.notify();
+    }
+
+    fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = Self::make_pane(None, window, cx);
+        self.ws_mut().tabs.insert_after_active(Tab::new(pane));
+        self.after_tab_change(window, cx);
+        if self.ws().root.is_some() {
+            self.open_picker(false, window, cx);
+        }
+    }
+
+    /// ⌘W: close the focused pane of a split, else the tab. Closing the last,
+    /// empty tab closes the window.
+    fn close_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab().is_split() {
+            let right = self.tab().focus_right;
+            self.close_pane(right, window, cx);
+        } else if self.ws().tabs.len() > 1 {
+            let ix = self.ws().tabs.active;
+            self.close_tab(ix, window, cx);
+        } else if !self.focused_pane().read(cx).is_blank() {
+            let pane = Self::make_pane(None, window, cx);
+            let tabs = &mut self.ws_mut().tabs;
+            let old = std::mem::replace(&mut tabs.active_mut().left, pane);
+            tabs.remember_pane(old);
+            self.after_tab_change(window, cx);
+        } else {
+            window.remove_window();
+        }
+    }
+
+    fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = &mut self.ws_mut().tabs;
+        if tabs.len() == 1 {
+            self.close_focused(window, cx);
+        } else if tabs.close(ix) {
+            self.after_tab_change(window, cx);
+        }
+    }
+
+    fn close_pane(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs = &mut self.ws_mut().tabs;
+        if let Some(pane) = tabs.active_mut().take_pane(right) {
+            tabs.remember_pane(pane);
+            self.after_tab_change(window, cx);
+        }
+    }
+
+    fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ws_mut().tabs.activate(ix) {
+            self.after_tab_change(window, cx);
+        }
+    }
+
+    /// ⌘\: show the focused document again beside itself, or split the two
+    /// panes back into separate tabs.
+    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab().is_split() {
+            self.ws_mut().tabs.pane_to_tab(true, false);
+        } else {
+            let pane = Self::make_pane(None, window, cx);
+            if let Some(path) = self.focused_pane().read(cx).path.clone() {
+                pane.update(cx, |p, cx| p.load_file(path, true, cx));
+            }
+            self.ws_mut().tabs.active_mut().split_with(pane, true);
+        }
+        self.after_tab_change(window, cx);
+    }
+
+    fn focus_pane(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.ws_mut().tabs.active_mut();
+        if tab.is_split() && tab.focus_right != right {
+            tab.focus_right = right;
+            self.after_tab_change(window, cx);
+        }
+    }
+
+    // MARK: Folder scanning and watching
+
+    fn scan(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(ws) = self.workspaces.get_mut(ix) else {
             return;
         };
-        self.folder_generation += 1;
-        let generation = self.folder_generation;
-        self.indexing = true;
+        let Some(root) = ws.root.clone() else {
+            ws.files.clear();
+            ws.rows.clear();
+            return;
+        };
+        ws.scan_generation += 1;
+        let generation = ws.scan_generation;
+        ws.indexing = true;
+        let walk = root.clone();
         let task = cx
             .background_executor()
-            .spawn(async move { files::discover(&root) });
-        self._scan = Some(cx.spawn(async move |this, cx| {
+            .spawn(async move { files::discover(&walk) });
+        ws._scan = Some(cx.spawn(async move |this, cx| {
             let (files, limited) = task.await;
             let _ = this.update(cx, |this, cx| {
-                if this.folder_generation == generation {
-                    this.files = files;
-                    this.limited = limited;
-                    this.indexing = false;
-                    this.rebuild_rows();
+                if let Some(ws) = this
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.root.as_ref() == Some(&root))
+                    && ws.scan_generation == generation
+                {
+                    ws.files = files;
+                    ws.limited = limited;
+                    ws.indexing = false;
+                    ws.scanned = true;
+                    ws.rebuild_rows();
                     cx.notify();
                 }
             });
@@ -204,256 +526,134 @@ impl Reader {
         cx.notify();
     }
 
-    fn rebuild_rows(&mut self) {
-        self.rows = self
-            .root
-            .as_ref()
-            .map(|r| files::rows(r, &self.files, &self.expanded))
-            .unwrap_or_default();
-        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-    }
-
-    fn load_file(&mut self, path: PathBuf, history: bool, cx: &mut Context<Self>) {
-        if !markdown_core::is_markdown(&path) {
-            self.error = Some("Only .md and .markdown files can be opened.".into());
-            cx.notify();
+    /// Watch the active workspace's folder, plus the folders of open files
+    /// that live outside it. Only the active workspace is watched; others
+    /// rescan when activated.
+    fn rewatch(&mut self, cx: &mut Context<Self>) {
+        let ws = self.ws();
+        let mut wanted: Vec<(PathBuf, bool)> = ws.root.iter().map(|r| (r.clone(), true)).collect();
+        for pane in ws.tabs.panes() {
+            if let Some(parent) = pane.read(cx).path.as_ref().and_then(|p| p.parent())
+                && !ws.contains(parent)
+                && !wanted.iter().any(|(p, _)| p == parent)
+            {
+                wanted.push((parent.to_owned(), false));
+            }
+        }
+        if wanted == self.watched {
             return;
         }
-        self.generation += 1;
-        let generation = self.generation;
-        self.loading = true;
-        self.error = None;
-        self.help = false;
-        self.path = Some(path.clone());
-        self.prefs.file = Some(path.clone());
-        if history && self.history.get(self.history_index) != Some(&path) {
-            if !self.history.is_empty() {
-                self.history.truncate(self.history_index + 1);
-            }
-            self.history.push(path.clone());
-            self.history_index = self.history.len() - 1;
-        }
-        let task = cx
-            .background_executor()
-            .spawn(async move { markdown_core::read_document(&path) });
-        self._load = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.generation != generation { return; }
-                this.loading = false;
-                match result {
-                    Ok(doc) => {
-                        // set_text preserves unchanged block identities and scroll on refresh.
-                        this.document = Some(doc); this.present(cx); this.watch(cx); this.prefs.save();
-                    },
-                    Err(e) => { this.error = Some(e); this.document = None; this.text.update(cx, |s, cx| s.set_text("# Unable to read this file\n\nCheck that it still exists and is readable, then press **⌘R** to retry.", cx)); },
-                }
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
-    fn present(&mut self, cx: &mut Context<Self>) {
-        let content = if self.help {
-            HELP.to_owned()
-        } else if let Some(doc) = &self.document {
-            if self.source {
-                doc.source_markdown()
-            } else {
-                doc.body.clone()
-            }
-        } else {
-            WELCOME.to_owned()
-        };
-        self.text.update(cx, |s, cx| s.set_text(&content, cx));
-        cx.notify();
-    }
-
-    fn watch(&mut self, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded(1);
+        self.watched = wanted.clone();
+        let (tx, rx) = async_channel::unbounded::<Vec<PathBuf>>();
         let Ok(mut watcher) =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event.is_ok_and(|e| !matches!(e.kind, notify::EventKind::Access(_))) {
-                    let _ = tx.try_send(());
+                if let Ok(e) = event
+                    && !matches!(e.kind, notify::EventKind::Access(_))
+                {
+                    let _ = tx.try_send(e.paths);
                 }
             })
         else {
             return;
         };
-        if let Some(root) = &self.root {
-            let _ = watcher.watch(root, notify::RecursiveMode::Recursive);
-        }
-        if let Some(parent) = self.path.as_ref().and_then(|p| p.parent())
-            && self.root.as_ref().is_none_or(|r| !parent.starts_with(r))
-        {
-            let _ = watcher.watch(parent, notify::RecursiveMode::NonRecursive);
+        for (dir, recursive) in &wanted {
+            let mode = if *recursive {
+                notify::RecursiveMode::Recursive
+            } else {
+                notify::RecursiveMode::NonRecursive
+            };
+            let _ = watcher.watch(dir, mode);
         }
         self._watch = Some(watcher);
         self._watch_task = Some(cx.spawn(async move |this, cx| {
-            while rx.recv().await.is_ok() {
+            while let Ok(first) = rx.recv().await {
                 cx.background_executor()
                     .timer(Duration::from_millis(350))
                     .await;
-                while rx.try_recv().is_ok() {}
-                let _ = this.update(cx, |this, cx| {
-                    this.scan(cx);
-                    if let Some(path) = this.path.clone() {
-                        this.load_file(path, false, cx);
-                    }
-                });
+                let mut changed = first;
+                while let Ok(more) = rx.try_recv() {
+                    changed.extend(more);
+                }
+                let _ = this.update(cx, |this, cx| this.files_changed(&changed, cx));
             }
         }));
     }
 
-    fn prompt(&mut self, folder: bool, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: !folder,
-            directories: folder,
-            multiple: false,
-            prompt: Some(
-                if folder {
-                    "Open Folder"
-                } else {
-                    "Open Markdown"
+    /// Rescan the tree and reload every open pane showing a changed file.
+    /// Paths are matched by name, since the watcher may report them through
+    /// a different (resolved) prefix.
+    fn files_changed(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
+        let names: HashSet<OsString> = changed
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_owned()))
+            .collect();
+        self.scan(self.active, cx);
+        let panes: Vec<_> = self.ws().tabs.panes().cloned().collect();
+        for pane in panes {
+            let hit = pane
+                .read(cx)
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| names.is_empty() || names.contains(n));
+            if hit {
+                pane.update(cx, |p, cx| p.reload(cx));
+            }
+        }
+    }
+
+    // MARK: Persistence
+
+    fn save(&mut self, cx: &App) {
+        self.prefs.workspaces = self
+            .workspaces
+            .iter()
+            .map(|ws| {
+                let mut expanded: Vec<_> = ws.expanded.iter().cloned().collect();
+                expanded.sort();
+                SavedWorkspace {
+                    root: ws.root.clone(),
+                    expanded,
+                    tabs: ws
+                        .tabs
+                        .tabs
+                        .iter()
+                        .map(|t| SavedTab {
+                            left: t.left.read(cx).to_saved(),
+                            right: t.right.as_ref().map(|p| p.read(cx).to_saved()),
+                            focus_right: t.focus_right,
+                            pinned: t.pinned,
+                        })
+                        .collect(),
+                    active_tab: ws.tabs.active,
                 }
-                .into(),
-            ),
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = paths.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let _ = this.update(cx, |this, cx| this.open_path(path, cx));
-            }
-        })
-        .detach();
+            })
+            .collect();
+        self.prefs.active_workspace = self.active;
+        self.prefs.save();
     }
 
-    fn copy_source(&mut self, cx: &mut Context<Self>) {
-        let Some(doc) = &self.document else { return };
-        cx.write_to_clipboard(ClipboardItem::new_string(doc.source_markdown()));
-        self.copied = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(1500))
-                .await;
-            let _ = this.update(cx, |v, cx| {
-                v.copied = false;
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn update_find(&mut self, cx: &mut Context<Self>) {
-        let query = self.find_input.read(cx).value();
-        let rendered = self.text.read(cx).rendered_text();
-        self.matches = markdown_core::find_ranges(rendered.as_str(), &query);
-        self.match_index = self.match_index.min(self.matches.len().saturating_sub(1));
-        let ranges = self.matches.clone();
-        let selected = self.match_index;
-        self.text.update(cx, |state, cx| {
-            let _ = state.set_range_highlights(
-                ranges.iter().enumerate().map(|(i, r)| {
-                    RangeHighlight::new(
-                        r.clone(),
-                        if i == selected {
-                            rgba(0xf4b94299)
-                        } else {
-                            rgba(0xf4d57755)
-                        },
-                    )
-                }),
-                cx,
-            );
-            if let Some(range) = ranges.get(selected) {
-                let _ = state.reveal_range(range.clone(), cx);
-            }
-        });
-        cx.notify();
-    }
-
-    fn next_match(&mut self, backwards: bool, cx: &mut Context<Self>) {
-        if !self.matches.is_empty() {
-            self.match_index = if backwards {
-                (self.match_index + self.matches.len() - 1) % self.matches.len()
-            } else {
-                (self.match_index + 1) % self.matches.len()
-            };
-            self.update_find(cx);
-        }
-    }
-
-    fn jump_anchor(&mut self, anchor: &str, cx: &mut Context<Self>) {
-        let Some(doc) = &self.document else {
-            return;
-        };
-        if let Some(heading) = doc.headings.iter().find(|h| h.id == anchor) {
-            let snapshot = self.text.read(cx).rendered_text();
-            if snapshot.source() != doc.body {
-                self.pending_anchor = Some(anchor.to_owned());
-                return;
-            }
-            if let Some(range) = snapshot.range_for_source(heading.range.clone()) {
-                self.text.update(cx, |s, cx| {
-                    let _ = s.reveal_range(range, cx);
-                });
-            }
-        }
-    }
-
-    fn follow(&mut self, link: &str, cx: &mut Context<Self>) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        match markdown_core::resolve_link(path, link) {
-            Link::Local(p, anchor) if markdown_core::is_markdown(&p) => {
-                if Some(&p) == self.path.as_ref() {
-                    if let Some(anchor) = anchor {
-                        self.jump_anchor(&anchor, cx);
-                    }
-                } else {
-                    self.pending_anchor = anchor;
-                    self.load_file(p, true, cx);
-                }
-            }
-            Link::External(url) => cx.open_url(&url),
-            _ => {
-                self.error = Some("This reader opens Markdown links and web links only.".into());
-                cx.notify();
-            }
-        }
-    }
-
-    fn navigate(&mut self, backwards: bool, cx: &mut Context<Self>) {
-        let next = if backwards {
-            self.history_index.checked_sub(1)
-        } else {
-            Some(self.history_index + 1)
-        };
-        if let Some(index) = next.filter(|i| *i < self.history.len()) {
-            self.history_index = index;
-            self.load_file(self.history[index].clone(), false, cx);
-        }
-    }
+    // MARK: Tree, focus, overlays
 
     fn focus_reader(&self, window: &mut Window, cx: &mut App) {
-        self.text.read(cx).focus_handle().clone().focus(window, cx);
+        let handle = self
+            .focused_pane()
+            .read(cx)
+            .text
+            .read(cx)
+            .focus_handle()
+            .clone();
+        handle.focus(window, cx);
     }
+
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.take().is_some() {
-        } else if self.find {
-            self.find = false;
-            self.text.update(cx, |s, cx| s.clear_range_highlights(cx));
-        } else if self.help {
-            self.help = false;
-            self.present(cx);
+        if self.picker.take().is_none() {
+            self.with_pane(cx, |p, cx| p.dismiss(cx));
         }
         self.focus_reader(window, cx);
         cx.notify();
     }
+
     fn open_picker(&mut self, outline: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = Some(outline);
         self.palette.update(cx, |s, cx| {
@@ -462,34 +662,63 @@ impl Reader {
         });
         cx.notify();
     }
-    fn tree_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+
+    /// ⌘↵ / ⌥↵: open the highlighted Quick Open result or tree row elsewhere.
+    fn open_selection(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let path = match self.picker {
+            Some(false) => {
+                let row = self.palette.read(cx).selected_index().map(|ix| ix.row);
+                let path = row.and_then(|r| self.ws().files.get(r).cloned());
+                self.close_overlay(window, cx);
+                path
+            }
+            Some(true) => return,
+            None => self
+                .ws()
+                .rows
+                .get(self.ws().selected)
+                .filter(|r| !r.directory)
+                .map(|r| r.path.clone()),
+        };
+        if let Some(path) = path {
+            self.open_in(path, target, window, cx);
+        }
+    }
+
+    fn tree_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let ws = self.ws_mut();
+        if ws.rows.is_empty() {
             return;
         }
-        self.selected = self
+        ws.selected = ws
             .selected
             .saturating_add_signed(delta)
-            .min(self.rows.len() - 1);
-        self.tree_scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
-        if !self.rows[self.selected].directory {
-            self.load_file(self.rows[self.selected].path.clone(), true, cx);
+            .min(ws.rows.len() - 1);
+        ws.tree_scroll
+            .scroll_to_item(ws.selected, ScrollStrategy::Nearest);
+        let row = ws.rows[ws.selected].clone();
+        if !row.directory {
+            self.open_in(row.path, Target::Focused, window, cx);
         }
         cx.notify();
     }
-    fn tree_open(&mut self, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get(self.selected).cloned() {
+
+    fn tree_open(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let ws = self.ws_mut();
+        if let Some(row) = ws.rows.get(ws.selected).cloned() {
             if row.directory {
-                if !self.expanded.remove(&row.path) {
-                    self.expanded.insert(row.path);
+                if !ws.expanded.remove(&row.path) {
+                    ws.expanded.insert(row.path);
                 }
-                self.rebuild_rows();
+                ws.rebuild_rows();
+                self.save(cx);
                 cx.notify();
             } else {
-                self.load_file(row.path, true, cx);
+                self.open_in(row.path, target, window, cx);
             }
         }
     }
+
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prefs.sidebar = !self.prefs.sidebar;
         if !self.prefs.sidebar && self.tree_focus.is_focused(window) {
@@ -498,18 +727,26 @@ impl Reader {
         self.prefs.save();
         cx.notify();
     }
+
     fn zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.prefs.font_size = if delta == 0. {
             16.
         } else {
             (self.prefs.font_size + delta).clamp(12., 26.)
         };
+        cx.set_global(FontSize(self.prefs.font_size));
         self.prefs.save();
         cx.notify();
     }
 
+    // MARK: Rendering
+
     fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let pane = self.focused_pane();
+        let pane = pane.read(cx);
+        let (source, help, has_doc, copied) =
+            (pane.source, pane.help, pane.document.is_some(), pane.copied);
         // 44px toolbar doubles as the title bar; traffic lights are centered in it (main.rs).
         TitleBar::new()
             .h(px(TOOLBAR_HEIGHT))
@@ -517,116 +754,175 @@ impl Reader {
             .border_color(theme.border)
             .when(window.is_fullscreen(), |d| d.pl_2())
             .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .w_full()
-                .pr_2()
-                .child(
-                    Button::new("sidebar")
-                        .ghost()
-                        .icon(IconName::PanelLeft)
-                        .tooltip("Toggle sidebar · ⌘B")
-                        .on_click(cx.listener(|v, _, w, cx| v.toggle_sidebar(w, cx))),
-                )
-                .child(
-                    Button::new("back")
-                        .ghost()
-                        .icon(IconName::ChevronLeft)
-                        .disabled(self.history_index == 0)
-                        .tooltip("Back · ⌘[")
-                        .on_click(cx.listener(|v, _, _, cx| v.navigate(true, cx))),
-                )
-                .child(
-                    Button::new("forward")
-                        .ghost()
-                        .icon(IconName::ChevronRight)
-                        .disabled(self.history_index + 1 >= self.history.len())
-                        .tooltip("Forward · ⌘]")
-                        .on_click(cx.listener(|v, _, _, cx| v.navigate(false, cx))),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .overflow_hidden()
-                        .child(
-                            self.path
-                                .as_ref()
-                                .and_then(|p| p.file_name())
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or("Markdown Viewer".into()),
-                        ),
-                )
-                .child(
-                    Button::new("quick-open")
-                        .ghost()
-                        .icon(IconName::Search)
-                        .label("Quick Open")
-                        .tooltip("Find a file · ⌘P or ⌘K")
-                        .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
-                )
-                .child(
-                    Button::new("outline")
-                        .ghost()
-                        .label("Outline")
-                        .tooltip("Heading outline · ⇧⌘L")
-                        .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
-                )
-                .when(self.source && !self.help && self.document.is_some(), |d| {
-                    d.child(
-                        Button::new("copy-source")
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .w_full()
+                    .pr_2()
+                    .child(
+                        Button::new("sidebar")
                             .ghost()
-                            .icon(if self.copied {
-                                IconName::Check
-                            } else {
-                                IconName::Copy
-                            })
-                            .label(if self.copied { "Copied" } else { "Copy" })
-                            .tooltip("Copy Markdown source")
-                            .on_click(cx.listener(|v, _, _, cx| v.copy_source(cx))),
+                            .icon(IconName::PanelLeft)
+                            .tooltip("Toggle sidebar · ⌘B")
+                            .on_click(cx.listener(|v, _, w, cx| v.toggle_sidebar(w, cx))),
                     )
-                })
-                .child(
-                    Button::new("source")
-                        .ghost()
-                        .label(if self.source { "Preview" } else { "Source" })
-                        .tooltip("Read-only source · ⇧⌘M")
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.source = !v.source;
-                            v.present(cx);
-                        })),
-                )
-                .child(
-                    Button::new("theme")
-                        .ghost()
-                        .icon(IconName::Sun)
-                        .tooltip("Toggle theme · ⇧⌘D")
-                        .on_click(
-                            cx.listener(|_, _, w, cx| w.dispatch_action(Box::new(ToggleTheme), cx)),
-                        ),
-                )
-                .child(
-                    Button::new("help")
-                        .ghost()
-                        .icon(IconName::Info)
-                        .tooltip("Shortcuts & Finder setup · ⌘/")
-                        .on_click(cx.listener(|v, _, _, cx| {
-                            v.help = !v.help;
-                            v.present(cx);
-                        })),
-                ),
-        )
+                    .child(
+                        Button::new("back")
+                            .ghost()
+                            .icon(IconName::ChevronLeft)
+                            .disabled(!pane.can_go_back())
+                            .tooltip("Back · ⌘[")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.with_pane(cx, |p, cx| p.navigate(true, cx))
+                            })),
+                    )
+                    .child(
+                        Button::new("forward")
+                            .ghost()
+                            .icon(IconName::ChevronRight)
+                            .disabled(!pane.can_go_forward())
+                            .tooltip("Forward · ⌘]")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.with_pane(cx, |p, cx| p.navigate(false, cx))
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(if pane.path.is_some() || help {
+                                pane.title()
+                            } else {
+                                "Markdown Viewer".into()
+                            }),
+                    )
+                    .child(
+                        Button::new("quick-open")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .label("Quick Open")
+                            .tooltip("Find a file · ⌘P or ⌘K")
+                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
+                    )
+                    .child(
+                        Button::new("outline")
+                            .ghost()
+                            .label("Outline")
+                            .tooltip("Heading outline · ⇧⌘L")
+                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
+                    )
+                    .child(
+                        Button::new("split")
+                            .ghost()
+                            .icon(IconName::PanelRight)
+                            .selected(self.tab().is_split())
+                            .tooltip("Split side by side · ⌘\\")
+                            .on_click(cx.listener(|v, _, w, cx| v.toggle_split(w, cx))),
+                    )
+                    .when(source && !help && has_doc, |d| {
+                        d.child(
+                            Button::new("copy-source")
+                                .ghost()
+                                .icon(if copied {
+                                    IconName::Check
+                                } else {
+                                    IconName::Copy
+                                })
+                                .label(if copied { "Copied" } else { "Copy" })
+                                .tooltip("Copy Markdown source")
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    v.with_pane(cx, |p, cx| p.copy_source(cx))
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("source")
+                            .ghost()
+                            .label(if source { "Preview" } else { "Source" })
+                            .tooltip("Read-only source · ⇧⌘M")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.with_pane(cx, |p, cx| p.toggle_source(cx))
+                            })),
+                    )
+                    .child(
+                        Button::new("theme")
+                            .ghost()
+                            .icon(IconName::Sun)
+                            .tooltip("Toggle theme · ⇧⌘D")
+                            .on_click(cx.listener(|_, _, w, cx| {
+                                w.dispatch_action(Box::new(ToggleTheme), cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("help")
+                            .ghost()
+                            .icon(IconName::Info)
+                            .tooltip("Shortcuts & Finder setup · ⌘/")
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.with_pane(cx, |p, cx| p.toggle_help(cx))
+                            })),
+                    ),
+            )
+    }
+
+    /// Sidebar header: the active workspace, with a menu to switch, add or
+    /// close workspaces.
+    fn workspace_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let names: Vec<(String, bool)> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.name(), i == self.active))
+            .collect();
+        let focus = self.focus.clone();
+        let label = if self.ws().root.is_none() && self.workspaces.len() == 1 {
+            "Open folder…".to_string()
+        } else {
+            self.ws().name()
+        };
+        Button::new("workspace-switcher")
+            .ghost()
+            .w_full()
+            .justify_start()
+            .icon(IconName::FolderOpen)
+            .label(label)
+            .dropdown_caret(true)
+            .tooltip("Switch workspace · ⌃1–9")
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.action_context(focus.clone()).min_w(px(220.));
+                for (i, (name, active)) in names.iter().enumerate() {
+                    let weak = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(if i < 9 {
+                            format!("{name}    ⌃{}", i + 1)
+                        } else {
+                            name.clone()
+                        })
+                        .checked(*active)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |v, cx| v.activate_workspace(i, window, cx));
+                        }),
+                    );
+                }
+                menu.separator()
+                    .menu("Add Folder…", Box::new(OpenFolder))
+                    .menu("Close Workspace", Box::new(CloseWorkspace))
+            })
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ws = self.ws();
+        let current = self.focused_pane().read(cx).path.clone();
         div()
             .id("folder-pane")
             .key_context("MarkdownTree")
             .track_focus(&self.tree_focus)
-            .w(px(242.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -639,41 +935,31 @@ impl Reader {
                     .px_4()
                     .pt_5()
                     .pb_3()
+                    .flex()
+                    .justify_between()
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
-                    .child("WORKSPACE"),
+                    .child("WORKSPACE")
+                    .when(self.workspaces.len() > 1, |d| {
+                        d.child(format!("{} of {}", self.active + 1, self.workspaces.len()))
+                    }),
             )
-            .child(
-                div().px_1().pb_3().child(
-                    Button::new("open-folder")
-                        .ghost()
-                        .w_full()
-                        .justify_start()
-                        .icon(IconName::FolderOpen)
-                        .label(
-                            self.root
-                                .as_ref()
-                                .and_then(|p| p.file_name())
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or("Open folder…".into()),
-                        )
-                        .on_click(cx.listener(|v, _, _, cx| v.prompt(true, cx))),
-                ),
-            )
+            .child(div().px_1().pb_3().child(self.workspace_switcher(cx)))
             .child(
                 uniform_list(
                     "file-tree",
-                    self.rows.len(),
-                    cx.processor(|this, range: Range<usize>, _, cx| {
+                    ws.rows.len(),
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
+                        let ws = this.ws();
                         range
                             .map(|index| {
-                                let row = &this.rows[index];
+                                let row = &ws.rows[index];
                                 let directory = row.directory;
                                 let current = if directory {
-                                    this.selected == index
+                                    ws.selected == index
                                 } else {
-                                    this.path.as_ref() == Some(&row.path)
+                                    current.as_ref() == Some(&row.path)
                                 };
                                 div()
                                     .id(("file", index))
@@ -692,7 +978,7 @@ impl Reader {
                                     })
                                     .child(
                                         Icon::new(if directory {
-                                            if this.expanded.contains(&row.path) {
+                                            if ws.expanded.contains(&row.path) {
                                                 IconName::ChevronDown
                                             } else {
                                                 IconName::ChevronRight
@@ -704,7 +990,7 @@ impl Reader {
                                         .text_color(cx.theme().muted_foreground),
                                     )
                                     .child(
-                                        div().overflow_hidden().child(
+                                        div().overflow_hidden().whitespace_nowrap().child(
                                             row.path
                                                 .file_name()
                                                 .unwrap_or_default()
@@ -712,29 +998,39 @@ impl Reader {
                                                 .into_owned(),
                                         ),
                                     )
-                                    .on_click(cx.listener(move |v, _, w, cx| {
-                                        v.selected = index;
+                                    .on_click(cx.listener(move |v, e: &ClickEvent, w, cx| {
+                                        let m = e.modifiers();
+                                        let target = if m.platform {
+                                            Target::NewTab
+                                        } else if m.alt {
+                                            Target::Split
+                                        } else {
+                                            Target::Focused
+                                        };
+                                        v.ws_mut().selected = index;
                                         v.tree_focus.focus(w, cx);
-                                        v.tree_open(cx);
+                                        v.tree_open(target, w, cx);
                                     }))
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
-                .track_scroll(&self.tree_scroll)
+                .track_scroll(&ws.tree_scroll)
                 .flex_1(),
             )
-            .when(self.rows.is_empty(), |d| {
+            .when(ws.rows.is_empty(), |d| {
                 d.child(
                     div()
                         .px_4()
                         .py_3()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if self.indexing {
+                        .child(if ws.indexing {
                             "Finding Markdown files…"
-                        } else {
+                        } else if ws.root.is_none() {
                             "Open a folder to browse its Markdown files."
+                        } else {
+                            "No Markdown files in this folder."
                         }),
                 )
             })
@@ -746,26 +1042,439 @@ impl Reader {
                     .border_color(cx.theme().border)
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(if self.indexing {
+                    .child(if ws.indexing {
                         "Indexing…".to_owned()
+                    } else if ws.root.is_none() {
+                        "Loose files".to_owned()
                     } else {
                         format!(
                             "{} Markdown files{}",
-                            self.files.len(),
-                            if self.limited {
-                                " · limit reached"
-                            } else {
-                                ""
-                            }
+                            ws.files.len(),
+                            if ws.limited { " · limit reached" } else { "" }
                         )
                     }),
             )
     }
 
+    fn tab_label(tab: &Tab<Entity<DocPane>>, cx: &App) -> String {
+        match &tab.right {
+            Some(right) => format!(
+                "{}  |  {}",
+                tab.left.read(cx).title(),
+                right.read(cx).title()
+            ),
+            None => tab.left.read(cx).title(),
+        }
+    }
+
+    fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (accent, muted) = (theme.accent, theme.muted);
+        let tabs = &self.ws().tabs;
+        let last = tabs.len() - 1;
+        let weak = cx.entity().downgrade();
+        let mut strip = div().id("tab-strip").flex().min_w_0().overflow_x_scroll();
+        for (ix, tab) in tabs.tabs.iter().enumerate() {
+            let selected = ix == tabs.active;
+            let (pinned, split) = (tab.pinned, tab.is_split());
+            let label: SharedString = Self::tab_label(tab, cx).into();
+            let ghost = label.clone();
+            let weak = weak.clone();
+            strip = strip.child(
+                div()
+                    .id(("tab", ix))
+                    .flex()
+                    .items_center()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .h(px(31.))
+                    .pl_3()
+                    .pr(px(if pinned { 12. } else { 6. }))
+                    .text_sm()
+                    .cursor_pointer()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .when(selected, |d| {
+                        d.bg(theme.background).text_color(theme.foreground)
+                    })
+                    .when(!selected, |d| {
+                        d.text_color(theme.muted_foreground)
+                            .hover(move |d| d.bg(muted))
+                    })
+                    .when(pinned, |d| {
+                        d.child(Icon::new(IconName::Star).small().text_color(theme.primary))
+                    })
+                    .when(split, |d| {
+                        d.child(
+                            Icon::new(IconName::PanelRight)
+                                .small()
+                                .text_color(theme.muted_foreground),
+                        )
+                    })
+                    .child(
+                        div()
+                            .max_w(px(if split {
+                                340.
+                            } else if pinned {
+                                120.
+                            } else {
+                                200.
+                            }))
+                            .truncate()
+                            .child(label),
+                    )
+                    .when(!pinned, |d| {
+                        d.child(
+                            Button::new(("close-tab", ix))
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Close tab · ⌘W")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_tab(ix, window, cx);
+                                })),
+                        )
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.activate_tab(ix, window, cx)),
+                    )
+                    .on_drag(DraggedTab { from: ix }, move |_, _, _, cx| {
+                        cx.new(|_| Ghost(ghost.clone()))
+                    })
+                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                        this.ws_mut().tabs.move_tab(dragged.from, ix);
+                        this.after_tab_change(window, cx);
+                    }))
+                    .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
+                        this.ws_mut().tabs.pane_to_tab(dragged.right, true);
+                        this.after_tab_change(window, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        let item = |label: &'static str,
+                                    f: fn(
+                            &mut Reader,
+                            usize,
+                            &mut Window,
+                            &mut Context<Reader>,
+                        )| {
+                            let weak = weak.clone();
+                            PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                let _ = weak.update(cx, |v, cx| f(v, ix, window, cx));
+                            })
+                        };
+                        menu.item(item(
+                            if pinned { "Unpin Tab" } else { "Pin Tab" },
+                            |v, ix, w, cx| {
+                                v.ws_mut().tabs.toggle_pin(ix);
+                                v.after_tab_change(w, cx);
+                            },
+                        ))
+                        .item(item(
+                            if split {
+                                "Separate Panes into Tabs"
+                            } else {
+                                "Split Side by Side"
+                            },
+                            |v, ix, w, cx| {
+                                v.ws_mut().tabs.activate(ix);
+                                v.toggle_split(w, cx);
+                            },
+                        ))
+                        .separator()
+                        .item(item("Close Tab", |v, ix, w, cx| v.close_tab(ix, w, cx)))
+                        .item(item("Close Other Tabs", |v, ix, w, cx| {
+                            v.ws_mut().tabs.close_others(ix);
+                            v.after_tab_change(w, cx);
+                        }))
+                    }),
+            );
+        }
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .h(px(32.))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(strip)
+            // Dropping on the empty space moves the tab to the end.
+            .child(
+                div()
+                    .id("tab-bar-end")
+                    .flex_1()
+                    .h_full()
+                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                        this.ws_mut().tabs.move_tab(dragged.from, last);
+                        this.after_tab_change(window, cx);
+                    }))
+                    .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
+                        this.ws_mut().tabs.pane_to_tab(dragged.right, true);
+                        this.after_tab_change(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("tab-bar-new")
+                    .icon(IconName::Plus)
+                    .ghost()
+                    .xsmall()
+                    .tooltip("New tab · ⌘T")
+                    .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx))),
+            )
+            .pr_2()
+    }
+
+    fn pane_id(base: &'static str, right: bool) -> SharedString {
+        if right {
+            format!("{base}-right").into()
+        } else {
+            base.into()
+        }
+    }
+
+    /// Title strip over each pane of a split. The accent line marks the pane
+    /// navigation applies to; drag it to the tab bar to separate the panes.
+    fn pane_header(&self, right: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let tab = self.tab();
+        let focused = tab.focus_right == right;
+        let title: SharedString = tab
+            .pane(right)
+            .map(|p| p.read(cx).title())
+            .unwrap_or_default()
+            .into();
+        let ghost = title.clone();
+        div()
+            .id(Self::pane_id("pane-header", right))
+            .relative()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .h(px(30.))
+            .pl_4()
+            .pr_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(if focused {
+                theme.background
+            } else {
+                theme.sidebar
+            })
+            .when(focused, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.))
+                        .bg(theme.primary),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .when(!focused, |d| d.text_color(theme.muted_foreground))
+                    .child(title),
+            )
+            .child(
+                Button::new(Self::pane_id("swap-panes", right))
+                    .icon(Icon::new(gpui_kit::assets::IconName::ArrowLeftRight))
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Swap panes")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.ws_mut().tabs.active_mut().swap();
+                        this.after_tab_change(window, cx);
+                    })),
+            )
+            .child(
+                Button::new(Self::pane_id("close-pane", right))
+                    .icon(IconName::Close)
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Close pane · ⌘W")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_pane(right, window, cx);
+                    })),
+            )
+            .on_drag(DraggedPane { right }, move |_, _, _, cx| {
+                cx.new(|_| Ghost(ghost.clone()))
+            })
+    }
+
+    /// A pane with its header (when split). Pressing anywhere in it, text
+    /// selection included, gives it focus.
+    fn pane_frame(&self, right: bool, header: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane = self.tab().pane(right).cloned();
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .capture_any_mouse_down(
+                cx.listener(move |this, _, window, cx| this.focus_pane(right, window, cx)),
+            )
+            .when(header, |d| d.child(self.pane_header(right, cx)))
+            .children(pane)
+    }
+
+    fn panes(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let available = f32::from(window.viewport_size().width)
+            - if self.prefs.sidebar {
+                SIDEBAR_WIDTH
+            } else {
+                0.
+            };
+        let theme = cx.theme();
+        let (border, primary) = (theme.border, theme.primary);
+        let tab = self.tab();
+        let split = tab.is_split();
+        let body = if !split {
+            self.pane_frame(false, false, cx).into_any_element()
+        } else if available < SPLIT_MIN_WIDTH {
+            // Too narrow for two: a switcher over the focused pane.
+            let mut switcher = div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .p_1()
+                .border_b_1()
+                .border_color(border);
+            for right in [false, true] {
+                let title = tab
+                    .pane(right)
+                    .map(|p| p.read(cx).title())
+                    .unwrap_or_default();
+                switcher = switcher.child(
+                    Button::new(Self::pane_id("pane-switch", right))
+                        .label(title)
+                        .small()
+                        .ghost()
+                        .selected(tab.focus_right == right)
+                        .on_click(cx.listener(move |this, _, w, cx| this.focus_pane(right, w, cx))),
+                );
+            }
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(switcher)
+                .child(self.pane_frame(tab.focus_right, true, cx))
+                .into_any_element()
+        } else {
+            let panel = |right: bool, cx: &mut Context<Self>| {
+                resizable_panel().size_range(px(280.)..Pixels::MAX).child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .child(self.pane_frame(right, true, cx)),
+                )
+            };
+            h_resizable("split-panes")
+                .with_state(&self.split_state)
+                .child(panel(false, cx))
+                .child(panel(true, cx))
+                .into_any_element()
+        };
+        let zone = self.drop_zone;
+        div()
+            .id("panes")
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .on_drag_move::<DraggedTab>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    let from = event.drag(cx).from;
+                    let inside = event.bounds.contains(&event.event.position);
+                    let zone = (inside && this.ws().tabs.can_split_with(from))
+                        .then(|| event.event.position.x > event.bounds.center().x);
+                    if this.drop_zone != zone {
+                        this.drop_zone = zone;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
+                if let Some(right) = this.drop_zone.take() {
+                    this.ws_mut().tabs.merge_into_active(dragged.from, right);
+                }
+                this.after_tab_change(window, cx);
+            }))
+            .child(body)
+            .when_some(zone, |d, right| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .w(relative(0.5))
+                        .when(right, |d| d.right_0())
+                        .when(!right, |d| d.left_0())
+                        .p_2()
+                        .child(
+                            div()
+                                .size_full()
+                                .rounded_lg()
+                                .border_2()
+                                .border_color(primary)
+                                .bg(primary.opacity(0.08)),
+                        ),
+                )
+            })
+    }
+
+    fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane = self.focused_pane();
+        let pane = pane.read(cx);
+        div()
+            .px_5()
+            .h(px(28.))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(if pane.source {
+                "SOURCE · READ ONLY"
+            } else {
+                "MARKDOWN · READ ONLY"
+            })
+            .child(format!(
+                "{}   ·   {} pt",
+                pane.document
+                    .as_ref()
+                    .map(|d| format!("{} words", d.body.split_whitespace().count()))
+                    .unwrap_or("Local files".into()),
+                self.prefs.font_size
+            ))
+    }
+
     fn picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let outline = self.picker == Some(true);
+        let ws = self.ws();
         let items: Vec<CommandItem> = if outline {
-            self.document
+            self.focused_pane()
+                .read(cx)
+                .document
                 .as_ref()
                 .map(|d| {
                     d.headings
@@ -780,17 +1489,15 @@ impl Reader {
                 })
                 .unwrap_or_default()
         } else {
-            self.files
+            ws.files
                 .iter()
                 .map(|path| {
                     CommandItem::new()
                         .label(
-                            path.strip_prefix(
-                                self.root.as_deref().unwrap_or(std::path::Path::new("/")),
-                            )
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .into_owned(),
+                            path.strip_prefix(ws.root.as_deref().unwrap_or(Path::new("/")))
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .into_owned(),
                         )
                         .action(Box::new(OpenPath { path: path.clone() }))
                 })
@@ -798,8 +1505,8 @@ impl Reader {
         };
         let empty_msg = if outline {
             "No headings in this document."
-        } else if self.root.is_none() {
-            "Open a folder (⇧⌘O) to search its Markdown files."
+        } else if ws.root.is_none() {
+            "Add a folder (⇧⌘O) to search its Markdown files."
         } else {
             "No matching files."
         };
@@ -851,13 +1558,17 @@ impl Reader {
                             .on_cancel(move |w, cx| {
                                 let _ = cancel.update(cx, |v, cx| v.close_overlay(w, cx));
                             })
-                            .footer(|_, _, cx| {
+                            .footer(move |_, _, cx| {
                                 div()
                                     .px_3()
                                     .py_2()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("↑ ↓ Navigate    ↵ Open    Esc Close")
+                                    .child(if outline {
+                                        "↑ ↓ Navigate    ↵ Jump    Esc Close"
+                                    } else {
+                                        "↑ ↓ Navigate    ↵ Open    ⌘↵ New tab    ⌥↵ Split    Esc Close"
+                                    })
                             }),
                     ),
             )
@@ -865,41 +1576,57 @@ impl Reader {
 
     #[cfg(feature = "screenshot")]
     pub fn ready(&self, cx: &App) -> bool {
-        !self.loading && !self.indexing && !self.text.read(cx).rendered_text().is_empty()
+        !self.ws().indexing && self.tab().panes().all(|p| p.read(cx).ready(cx))
     }
+
     #[cfg(feature = "screenshot")]
     pub fn debug_actions(&mut self, actions: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Paths in actions are relative to the workspace folder, else to the
+        // first document's folder; `~` stands for a space.
+        let base = self.ws().root.clone().or_else(|| {
+            self.focused_pane()
+                .read(cx)
+                .path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        });
+        let resolve = |base: &Option<PathBuf>, name: &str| {
+            base.as_ref().map(|b| b.join(name.replace('~', " ")))
+        };
         for action in actions.split(',') {
-            match action {
+            let (name, arg) = action.split_once(':').unwrap_or((action, ""));
+            match name {
                 "dark" => Theme::change(ThemeMode::Dark, Some(window), cx),
                 "light" => Theme::change(ThemeMode::Light, Some(window), cx),
                 "nosidebar" => self.prefs.sidebar = false,
                 "browse" => {
-                    if let Some(parent) = self
-                        .path
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .map(|p| p.to_path_buf())
-                    {
-                        self.open_folder(parent, cx);
+                    if let Some(parent) = base.clone() {
+                        self.add_folder(parent, window, cx);
                     }
                 }
-                "properties" => self.properties = true,
-                "source" => {
-                    self.source = true;
-                    self.present(cx);
+                "workspace" => self.add_folder(PathBuf::from(arg), window, cx),
+                "tab" => {
+                    if let Some(path) = resolve(&self.ws().root.clone().or(base.clone()), arg) {
+                        self.open_in(path, Target::NewTab, window, cx);
+                    }
                 }
-                "help" => {
-                    self.help = true;
-                    self.present(cx);
+                "split" => {
+                    if let Some(path) = resolve(&self.ws().root.clone().or(base.clone()), arg) {
+                        self.open_in(path, Target::Split, window, cx);
+                    }
                 }
+                "properties" => self.with_pane(cx, |p, cx| {
+                    p.properties = true;
+                    cx.notify();
+                }),
+                "source" => self.with_pane(cx, |p, cx| p.toggle_source(cx)),
+                "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(false, window, cx),
                 "outline" => self.open_picker(true, window, cx),
-                a if a.starts_with("find:") => {
-                    self.find = true;
-                    self.find_input
-                        .update(cx, |s, cx| s.set_value(&a[5..], window, cx));
-                    self.update_find(cx);
+                "find" => {
+                    let pane = self.focused_pane();
+                    pane.update(cx, |p, cx| p.set_find_query(arg, window, cx));
                 }
                 _ => {}
             }
@@ -910,22 +1637,7 @@ impl Reader {
 
 impl Render for Reader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let weak = cx.entity().downgrade();
-        let image_base = self.path.clone();
-        let reader = TextView::new(&self.text)
-            .scrollable(true)
-            .size_full()
-            .image_source(move |uri| {
-                if let Some(base) = &image_base
-                    && let Link::Local(path, _) = markdown_core::resolve_link(base, uri.as_ref())
-                {
-                    return ImageSource::from(path);
-                }
-                ImageSource::from(PathBuf::from("/nonexistent/remote-images-disabled"))
-            })
-            .on_link_click(move |url, _, _, cx| {
-                let _ = weak.update(cx, |v, cx| v.follow(url, cx));
-            });
+        let show_tabs = self.ws().tabs.len() > 1;
         div()
             .id("viewer")
             .key_context("Viewer")
@@ -935,8 +1647,8 @@ impl Render for Reader {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|v, _: &OpenFile, _, cx| v.prompt(false, cx)))
-            .on_action(cx.listener(|v, _: &OpenFolder, _, cx| v.prompt(true, cx)))
+            .on_action(cx.listener(|v, _: &OpenFile, w, cx| v.prompt(false, w, cx)))
+            .on_action(cx.listener(|v, _: &OpenFolder, w, cx| v.prompt(true, w, cx)))
             .on_action(cx.listener(|v, _: &ToggleSidebar, w, cx| v.toggle_sidebar(w, cx)))
             .on_action(cx.listener(|v, _: &FocusSidebar, w, cx| {
                 v.prefs.sidebar = true;
@@ -946,38 +1658,37 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &FocusReader, w, cx| v.focus_reader(w, cx)))
             .on_action(cx.listener(|v, _: &QuickOpen, w, cx| v.open_picker(false, w, cx)))
             .on_action(cx.listener(|v, _: &Outline, w, cx| v.open_picker(true, w, cx)))
-            .on_action(cx.listener(|v, a: &OpenPath, _, cx| {
+            .on_action(cx.listener(|v, a: &OpenPath, w, cx| {
                 v.picker = None;
-                v.load_file(a.path.clone(), true, cx);
+                v.open_in(a.path.clone(), Target::Focused, w, cx);
             }))
+            .on_action(
+                cx.listener(|v, _: &OpenInNewTab, w, cx| v.open_selection(Target::NewTab, w, cx)),
+            )
+            .on_action(
+                cx.listener(|v, _: &OpenInSplit, w, cx| v.open_selection(Target::Split, w, cx)),
+            )
             .on_action(cx.listener(|v, a: &JumpHeading, _, cx| {
-                if let Some(id) = v
-                    .document
-                    .as_ref()
-                    .and_then(|d| d.headings.get(a.index))
-                    .map(|h| h.id.clone())
-                {
-                    v.source = false;
-                    v.help = false;
-                    v.present(cx);
-                    v.jump_anchor(&id, cx);
-                }
+                v.with_pane(cx, |p, cx| p.jump_heading(a.index, cx))
             }))
             .on_action(cx.listener(|v, _: &Find, w, cx| {
-                v.find = true;
-                v.find_input.update(cx, |s, cx| s.focus(w, cx));
-                cx.notify();
+                v.focused_pane().update(cx, |p, cx| p.open_find(w, cx))
             }))
-            .on_action(cx.listener(|v, _: &NextMatch, _, cx| v.next_match(false, cx)))
-            .on_action(cx.listener(|v, _: &PrevMatch, _, cx| v.next_match(true, cx)))
+            .on_action(cx.listener(|v, _: &NextMatch, _, cx| {
+                v.with_pane(cx, |p, cx| p.next_match(false, cx))
+            }))
+            .on_action(cx.listener(|v, _: &PrevMatch, _, cx| {
+                v.with_pane(cx, |p, cx| p.next_match(true, cx))
+            }))
             .on_action(cx.listener(|v, _: &Escape, w, cx| v.close_overlay(w, cx)))
             .on_action(cx.listener(|v, _: &ToggleSource, _, cx| {
-                v.source = !v.source;
-                v.present(cx);
+                v.with_pane(cx, |p, cx| p.toggle_source(cx))
             }))
             .on_action(cx.listener(|v, _: &ToggleProperties, _, cx| {
-                v.properties = !v.properties;
-                cx.notify();
+                v.with_pane(cx, |p, cx| {
+                    p.properties = !p.properties;
+                    cx.notify();
+                })
             }))
             .on_action(cx.listener(|v, _: &ToggleTheme, w, cx| {
                 let dark = !cx.theme().mode.is_dark();
@@ -997,41 +1708,68 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &Larger, _, cx| v.zoom(1., cx)))
             .on_action(cx.listener(|v, _: &Smaller, _, cx| v.zoom(-1., cx)))
             .on_action(cx.listener(|v, _: &ResetSize, _, cx| v.zoom(0., cx)))
-            .on_action(cx.listener(|v, _: &Back, _, cx| v.navigate(true, cx)))
-            .on_action(cx.listener(|v, _: &Forward, _, cx| v.navigate(false, cx)))
+            .on_action(
+                cx.listener(|v, _: &Back, _, cx| v.with_pane(cx, |p, cx| p.navigate(true, cx))),
+            )
+            .on_action(
+                cx.listener(|v, _: &Forward, _, cx| v.with_pane(cx, |p, cx| p.navigate(false, cx))),
+            )
             .on_action(cx.listener(|v, _: &Reload, _, cx| {
-                if let Some(p) = v.path.clone() {
-                    v.load_file(p, false, cx);
-                }
-                v.scan(cx);
+                v.with_pane(cx, |p, cx| p.reload(cx));
+                v.scan(v.active, cx);
             }))
             .on_action(cx.listener(|_, _: &CloseWindow, w, _| w.remove_window()))
             .on_action(cx.listener(|_, _: &FullScreen, w, _| w.toggle_fullscreen()))
-            .on_action(cx.listener(|v, _: &Help, _, cx| {
-                v.help = !v.help;
-                v.present(cx);
+            .on_action(cx.listener(|v, _: &Help, _, cx| v.with_pane(cx, |p, cx| p.toggle_help(cx))))
+            .on_action(cx.listener(|v, _: &NewTab, w, cx| v.new_tab(w, cx)))
+            .on_action(cx.listener(|v, _: &CloseTab, w, cx| v.close_focused(w, cx)))
+            .on_action(cx.listener(|v, _: &ReopenClosedTab, w, cx| {
+                if v.ws_mut().tabs.reopen() {
+                    v.after_tab_change(w, cx);
+                }
             }))
-            .on_action(cx.listener(|v, _: &TreeUp, _, cx| v.tree_move(-1, cx)))
-            .on_action(cx.listener(|v, _: &TreeDown, _, cx| v.tree_move(1, cx)))
-            .on_action(cx.listener(|v, _: &TreeOpen, _, cx| v.tree_open(cx)))
+            .on_action(cx.listener(|v, _: &NextTab, w, cx| {
+                v.ws_mut().tabs.cycle(1);
+                v.after_tab_change(w, cx);
+            }))
+            .on_action(cx.listener(|v, _: &PrevTab, w, cx| {
+                v.ws_mut().tabs.cycle(-1);
+                v.after_tab_change(w, cx);
+            }))
+            .on_action(cx.listener(|v, _: &ToggleSplit, w, cx| v.toggle_split(w, cx)))
+            .on_action(cx.listener(|v, _: &FocusLeftPane, w, cx| v.focus_pane(false, w, cx)))
+            .on_action(cx.listener(|v, _: &FocusRightPane, w, cx| v.focus_pane(true, w, cx)))
+            .on_action(
+                cx.listener(|v, a: &SwitchWorkspace, w, cx| v.activate_workspace(a.index, w, cx)),
+            )
+            .on_action(cx.listener(|v, _: &NextWorkspace, w, cx| v.cycle_workspace(1, w, cx)))
+            .on_action(cx.listener(|v, _: &PrevWorkspace, w, cx| v.cycle_workspace(-1, w, cx)))
+            .on_action(
+                cx.listener(|v, _: &CloseWorkspace, w, cx| v.close_workspace(v.active, w, cx)),
+            )
+            .on_action(cx.listener(|v, _: &TreeUp, w, cx| v.tree_move(-1, w, cx)))
+            .on_action(cx.listener(|v, _: &TreeDown, w, cx| v.tree_move(1, w, cx)))
+            .on_action(cx.listener(|v, _: &TreeOpen, w, cx| v.tree_open(Target::Focused, w, cx)))
             .on_action(cx.listener(|v, _: &TreeLeft, _, cx| {
-                if let Some(row) = v.rows.get(v.selected) {
-                    if v.expanded.remove(&row.path) {
-                        v.rebuild_rows();
+                let ws = v.ws_mut();
+                if let Some(row) = ws.rows.get(ws.selected).cloned() {
+                    if ws.expanded.remove(&row.path) {
+                        ws.rebuild_rows();
                     } else if let Some(parent) = row.path.parent()
-                        && let Some(index) = v.rows.iter().position(|r| r.path == parent)
+                        && let Some(index) = ws.rows.iter().position(|r| r.path == parent)
                     {
-                        v.selected = index;
+                        ws.selected = index;
                     }
                 }
                 cx.notify();
             }))
-            .on_action(cx.listener(|v, _: &TreeRight, _, cx| {
-                if let Some(row) = v.rows.get(v.selected) {
-                    if row.directory && !v.expanded.contains(&row.path) {
-                        v.tree_open(cx);
+            .on_action(cx.listener(|v, _: &TreeRight, w, cx| {
+                let ws = v.ws();
+                if let Some(row) = ws.rows.get(ws.selected) {
+                    if row.directory && !ws.expanded.contains(&row.path) {
+                        v.tree_open(Target::Focused, w, cx);
                     } else {
-                        v.tree_move(1, cx);
+                        v.tree_move(1, w, cx);
                     }
                 }
             }))
@@ -1050,183 +1788,9 @@ impl Render for Reader {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .when(self.find, |d| {
-                                d.child(
-                                    div()
-                                        .px_4()
-                                        .py_2()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .child(Input::new(&self.find_input).w(px(300.)))
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!(
-                                                    "{} / {}",
-                                                    if self.matches.is_empty() {
-                                                        0
-                                                    } else {
-                                                        self.match_index + 1
-                                                    },
-                                                    self.matches.len()
-                                                )),
-                                        )
-                                        .child(
-                                            Button::new("find-prev")
-                                                .ghost()
-                                                .icon(IconName::ChevronUp)
-                                                .on_click(cx.listener(|v, _, _, cx| {
-                                                    v.next_match(true, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("find-next")
-                                                .ghost()
-                                                .icon(IconName::ChevronDown)
-                                                .on_click(cx.listener(|v, _, _, cx| {
-                                                    v.next_match(false, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new("close-find").ghost().label("×").on_click(
-                                                cx.listener(|v, _, w, cx| v.close_overlay(w, cx)),
-                                            ),
-                                        ),
-                                )
-                            })
-                            .when_some(self.error.clone(), |d, error| {
-                                d.child(
-                                    div()
-                                        .px_5()
-                                        .py_2()
-                                        .text_sm()
-                                        .bg(cx.theme().muted)
-                                        .child(error),
-                                )
-                            })
-                            .when_some(
-                                self.document
-                                    .as_ref()
-                                    .and_then(|d| d.metadata_error.clone()),
-                                |d, error| {
-                                    d.child(
-                                        div()
-                                            .px_5()
-                                            .py_2()
-                                            .text_sm()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(error),
-                                    )
-                                },
-                            )
-                            .when(
-                                self.document.as_ref().is_some_and(|d| d.metadata.is_some())
-                                    && !self.source
-                                    && !self.help,
-                                |d| {
-                                    d.child(
-                                        div()
-                                            .px(px(20.))
-                                            .pt_2()
-                                            .flex()
-                                            .flex_col()
-                                            .items_start()
-                                            .child(
-                                                Button::new("properties")
-                                                    .ghost()
-                                                    .justify_start()
-                                                    .icon(if self.properties {
-                                                        IconName::ChevronDown
-                                                    } else {
-                                                        IconName::ChevronRight
-                                                    })
-                                                    .label("Properties")
-                                                    .on_click(cx.listener(|v, _, _, cx| {
-                                                        v.properties = !v.properties;
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .when(self.properties, |d| {
-                                                d.child(
-                                                    div()
-                                                        .id("metadata")
-                                                        .max_h(px(160.))
-                                                        .overflow_y_scroll()
-                                                        .px_3()
-                                                        .py_2()
-                                                        .text_sm()
-                                                        .font_family("Menlo")
-                                                        .child(
-                                                            self.document
-                                                                .as_ref()
-                                                                .and_then(|d| d.metadata.clone())
-                                                                .unwrap_or_default(),
-                                                        ),
-                                                )
-                                            }),
-                                    )
-                                },
-                            )
-                            .when(self.path.is_none() && !self.source && !self.help, |d| {
-                                d.child(
-                                    div().px(px(32.)).pt(px(24.)).child(
-                                        img(std::sync::Arc::new(Image::from_bytes(
-                                            ImageFormat::Png,
-                                            LOGO.to_vec(),
-                                        )))
-                                        .size(px(72.)),
-                                    ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .px(px(32.))
-                                    .py(px(24.))
-                                    .text_size(px(self.prefs.font_size))
-                                    .line_height(relative(1.65))
-                                    .child(if self.loading {
-                                        div()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child("Opening document…")
-                                            .into_any_element()
-                                    } else {
-                                        reader.into_any_element()
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .px_5()
-                                    .h(px(28.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .border_t_1()
-                                    .border_color(cx.theme().border)
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.source {
-                                        "SOURCE · READ ONLY"
-                                    } else {
-                                        "MARKDOWN · READ ONLY"
-                                    })
-                                    .child(format!(
-                                        "{}   ·   {} pt",
-                                        self.document
-                                            .as_ref()
-                                            .map(|d| format!(
-                                                "{} words",
-                                                d.body.split_whitespace().count()
-                                            ))
-                                            .unwrap_or("Local files".into()),
-                                        self.prefs.font_size
-                                    )),
-                            ),
+                            .when(show_tabs, |d| d.child(self.tab_bar(cx)))
+                            .child(self.panes(window, cx))
+                            .child(self.footer(cx)),
                     )
                     .when(self.picker.is_some(), |d| d.child(self.picker(cx))),
             )
@@ -1238,6 +1802,7 @@ mod tests {
     use super::*;
     use core::prelude::v1::test;
     use gpui_kit::{base::Root, test::TestWindowExt};
+    use markdown_core::Document;
 
     fn open(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Reader>) {
         cx.update(|cx| {
@@ -1271,6 +1836,30 @@ mod tests {
         .unwrap();
         cx.run_until_parked();
     }
+    /// Run `f` on the reader with its window.
+    fn with_reader<R>(
+        w: WindowHandle<Root>,
+        view: &Entity<Reader>,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut Reader, &mut Window, &mut Context<Reader>) -> R,
+    ) -> R {
+        let r = cx
+            .update_window(w.into(), |_, w, cx| view.update(cx, |v, cx| f(v, w, cx)))
+            .unwrap();
+        cx.run_until_parked();
+        r
+    }
+    fn pane<R>(view: &Entity<Reader>, cx: &mut TestAppContext, f: impl FnOnce(&DocPane) -> R) -> R {
+        view.read_with(cx, |v, cx| f(v.focused_pane().read(cx)))
+    }
+    fn folder(names: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, body) in names {
+            std::fs::write(tmp.path().join(name), body).unwrap();
+        }
+        tmp
+    }
+
     #[gpui_kit::test]
     fn sidebar_shortcuts_keep_reader_focus_and_source_is_read_only(cx: &mut TestAppContext) {
         let (w, view) = open(cx);
@@ -1282,8 +1871,10 @@ mod tests {
         interact(w, cx, |w, cx| w.press("cmd-b", cx));
         assert!(view.read_with(cx, |v, _| v.prefs.sidebar));
         view.update(cx, |v, cx| {
-            v.document = Some(Document::parse("# Original\n- [ ] untouched".into()));
-            v.present(cx);
+            v.with_pane(cx, |p, cx| {
+                p.document = Some(Document::parse("# Original\n- [ ] untouched".into()));
+                p.present(cx);
+            })
         });
         cx.run_until_parked();
         interact(w, cx, |w, cx| {
@@ -1291,20 +1882,23 @@ mod tests {
             w.press("cmd-2", cx);
             w.input("must not edit", cx);
         });
-        assert!(view.read_with(cx, |v, _| v.source));
+        assert!(pane(&view, cx, |p| p.source));
         assert_eq!(
-            view.read_with(cx, |v, _| v.document.as_ref().unwrap().source.clone()),
+            pane(&view, cx, |p| p.document.as_ref().unwrap().source.clone()),
             "# Original\n- [ ] untouched"
         );
     }
+
     #[gpui_kit::test]
     fn find_matches_rendered_text_and_escape_dismisses(cx: &mut TestAppContext) {
         let (w, view) = open(cx);
         view.update(cx, |v, cx| {
-            v.document = Some(Document::parse(
-                "# Hello **world**\n\nAnother WORLD.".into(),
-            ));
-            v.present(cx);
+            v.with_pane(cx, |p, cx| {
+                p.document = Some(Document::parse(
+                    "# Hello **world**\n\nAnother WORLD.".into(),
+                ));
+                p.present(cx);
+            })
         });
         cx.run_until_parked();
         interact(w, cx, |w, cx| {
@@ -1312,24 +1906,20 @@ mod tests {
             w.render_frame(cx);
             w.input("world", cx);
         });
-        assert_eq!(view.read_with(cx, |v, _| v.matches.len()), 2);
+        assert_eq!(pane(&view, cx, |p| p.matches.len()), 2);
         interact(w, cx, |w, cx| w.press("cmd-g", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.match_index), 1);
+        assert_eq!(pane(&view, cx, |p| p.match_index), 1);
         interact(w, cx, |w, cx| w.press("escape", cx));
-        assert!(!view.read_with(cx, |v, _| v.find));
+        assert!(!pane(&view, cx, |p| p.find));
     }
+
     #[gpui_kit::test]
     fn quick_open_filters_and_opens_with_keyboard(cx: &mut TestAppContext) {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = tmp.path().join("Alpha.md");
+        let tmp = folder(&[("Alpha.md", "# Alpha"), ("Beta.md", "# Beta")]);
         let second = tmp.path().join("Beta.md");
-        std::fs::write(&first, "# Alpha").unwrap();
-        std::fs::write(&second, "# Beta").unwrap();
         let (w, view) = open(cx);
-        view.update(cx, |v, _| {
-            v.root = Some(tmp.path().to_owned());
-            v.files = vec![first, second.clone()];
-            v.rebuild_rows();
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(tmp.path().into(), w, cx)
         });
         interact(w, cx, |w, cx| {
             w.press("cmd-p", cx);
@@ -1337,23 +1927,137 @@ mod tests {
             w.input("Beta", cx);
         });
         interact(w, cx, |w, cx| w.press("enter", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.path.clone()), Some(second));
+        assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(second));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
     }
 
     #[gpui_kit::test]
-    fn copy_source_writes_markdown_to_clipboard(cx: &mut TestAppContext) {
-        let tmp = tempfile::tempdir().unwrap();
-        let file = tmp.path().join("Doc.md");
-        std::fs::write(&file, "# Doc\n\nbody").unwrap();
-        let (_, view) = open(cx);
-        view.update(cx, |v, cx| v.load_file(file, true, cx));
-        cx.run_until_parked();
-        view.update(cx, |v, cx| {
-            v.source = true;
-            v.copy_source(cx);
+    fn quick_open_cmd_enter_opens_a_new_tab_and_alt_enter_splits(cx: &mut TestAppContext) {
+        let tmp = folder(&[("Alpha.md", "# Alpha"), ("Beta.md", "# Beta")]);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(tmp.path().into(), w, cx)
         });
-        assert!(view.read_with(cx, |v, _| v.copied));
+        interact(w, cx, |w, cx| {
+            w.press("cmd-p", cx);
+            w.render_frame(cx);
+            w.input("Alpha", cx);
+        });
+        interact(w, cx, |w, cx| w.press("cmd-enter", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(pane(&view, cx, |p| p.title()), "Alpha.md");
+
+        interact(w, cx, |w, cx| {
+            w.press("cmd-p", cx);
+            w.render_frame(cx);
+            w.input("Beta", cx);
+        });
+        interact(w, cx, |w, cx| w.press("alt-enter", cx));
+        let (split, right) = view.read_with(cx, |v, _| (v.tab().is_split(), v.tab().focus_right));
+        assert!(split && right);
+        assert_eq!(pane(&view, cx, |p| p.title()), "Beta.md");
+    }
+
+    #[gpui_kit::test]
+    fn tabs_split_close_and_reopen(cx: &mut TestAppContext) {
+        let tmp = folder(&[("A.md", "# A"), ("B.md", "# B")]);
+        let (a, b) = (tmp.path().join("A.md"), tmp.path().join("B.md"));
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_in(a.clone(), Target::Focused, w, cx);
+            v.open_in(b.clone(), Target::NewTab, w, cx);
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+
+        // ⌘\ shows B twice side by side; actions follow the focused pane.
+        interact(w, cx, |w, cx| w.press("cmd-\\", cx));
+        assert!(view.read_with(cx, |v, _| v.tab().is_split()));
+        interact(w, cx, |w, cx| w.press("cmd-shift-m", cx));
+        let sources = view.read_with(cx, |v, cx| {
+            v.tab()
+                .panes()
+                .map(|p| p.read(cx).source)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(sources, [false, true], "only the focused pane toggles");
+
+        // ⌘W closes the focused pane first, then the tab.
+        interact(w, cx, |w, cx| w.press("cmd-w", cx));
+        assert!(!view.read_with(cx, |v, _| v.tab().is_split()));
+        interact(w, cx, |w, cx| w.press("cmd-w", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 1);
+        assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(a));
+        interact(w, cx, |w, cx| w.press("cmd-shift-t", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(b));
+        interact(w, cx, |w, cx| w.press("ctrl-tab", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.active), 0);
+    }
+
+    #[gpui_kit::test]
+    fn workspaces_keep_their_own_tabs_and_files_route_home(cx: &mut TestAppContext) {
+        let one = folder(&[("One.md", "# One")]);
+        let two = folder(&[("Two.md", "# Two")]);
+        let loose = folder(&[("Loose.md", "# Loose")]);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(one.path().into(), w, cx);
+            v.open_in(one.path().join("One.md"), Target::Focused, w, cx);
+            v.add_folder(two.path().into(), w, cx);
+        });
+        // The empty Files workspace was adopted by the first folder.
+        assert_eq!(
+            view.read_with(cx, |v, _| (v.workspaces.len(), v.active)),
+            (2, 1)
+        );
+        assert!(pane(&view, cx, |p| p.is_blank()));
+
+        // A file under folder one goes back to its workspace and tab.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_path(one.path().join("One.md"), w, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| (v.active, v.ws().tabs.len())),
+            (0, 1)
+        );
+
+        // A file outside every folder gets a Files workspace.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_path(loose.path().join("Loose.md"), w, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| (v.workspaces.len(), v.active)),
+            (3, 2)
+        );
+        assert_eq!(pane(&view, cx, |p| p.title()), "Loose.md");
+
+        interact(w, cx, |w, cx| w.press("ctrl-2", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.active), 1);
+        assert!(
+            view.read_with(cx, |v, _| v.ws().files.len() == 1),
+            "rescanned on switch"
+        );
+
+        // Saved and restored.
+        let saved = view.read_with(cx, |v, _| v.prefs.workspaces.clone());
+        assert_eq!(saved.len(), 3);
+        assert_eq!(saved[0].tabs[0].left.path, Some(one.path().join("One.md")));
+    }
+
+    #[gpui_kit::test]
+    fn copy_source_writes_markdown_to_clipboard(cx: &mut TestAppContext) {
+        let tmp = folder(&[("Doc.md", "# Doc\n\nbody")]);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_in(tmp.path().join("Doc.md"), Target::Focused, w, cx)
+        });
+        view.update(cx, |v, cx| {
+            v.with_pane(cx, |p, cx| {
+                p.source = true;
+                p.copy_source(cx);
+            })
+        });
+        assert!(pane(&view, cx, |p| p.copied));
         let text = cx.read_from_clipboard().and_then(|c| c.text());
         assert!(text.is_some_and(|t| t.contains("# Doc")));
     }
@@ -1369,31 +2073,32 @@ mod tests {
 
     #[gpui_kit::test]
     fn rapid_navigation_keeps_latest_file_and_handles_deletion(cx: &mut TestAppContext) {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = tmp.path().join("First.md");
-        let second = tmp.path().join("Second.md");
-        std::fs::write(&first, "# First").unwrap();
-        std::fs::write(&second, "# Second\n- [ ] untouched").unwrap();
+        let tmp = folder(&[
+            ("First.md", "# First"),
+            ("Second.md", "# Second\n- [ ] untouched"),
+        ]);
+        let (first, second) = (tmp.path().join("First.md"), tmp.path().join("Second.md"));
         let (_, view) = open(cx);
         view.update(cx, |v, cx| {
-            v.load_file(first.clone(), true, cx);
-            v.load_file(second.clone(), true, cx);
+            v.with_pane(cx, |p, cx| {
+                p.load_file(first.clone(), true, cx);
+                p.load_file(second.clone(), true, cx);
+            })
         });
         cx.run_until_parked();
         assert_eq!(
-            view.read_with(cx, |v, _| v.document.as_ref().map(|d| d.body.clone())),
+            pane(&view, cx, |p| p.document.as_ref().map(|d| d.body.clone())),
             Some("# Second\n- [ ] untouched".into())
         );
-        view.update(cx, |v, cx| v.navigate(true, cx));
+        view.update(cx, |v, cx| v.with_pane(cx, |p, cx| p.navigate(true, cx)));
         cx.run_until_parked();
-        assert_eq!(
-            view.read_with(cx, |v, _| v.path.clone()),
-            Some(first.clone())
-        );
+        assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(first.clone()));
         std::fs::remove_file(&first).unwrap();
-        view.update(cx, |v, cx| v.load_file(first, false, cx));
+        view.update(cx, |v, cx| {
+            v.with_pane(cx, |p, cx| p.load_file(first, false, cx))
+        });
         cx.run_until_parked();
-        assert!(view.read_with(cx, |v, _| v.error.is_some()));
+        assert!(pane(&view, cx, |p| p.error.is_some()));
         assert_eq!(
             std::fs::read_to_string(&second).unwrap(),
             "# Second\n- [ ] untouched"
