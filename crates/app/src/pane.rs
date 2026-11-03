@@ -16,7 +16,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
-use markdown_core::{Document, Link};
+use markdown_core::{Document, Link, Stats};
 use std::{ops::Range, path::PathBuf};
 
 const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
@@ -39,6 +39,8 @@ pub struct DocPane {
     find_input: Entity<InputState>,
     pub path: Option<PathBuf>,
     pub document: Option<Document>,
+    /// What the document is made of; computed with it, off the main thread.
+    pub stats: Option<Stats>,
     pub source: bool,
     pub properties: bool,
     pub help: bool,
@@ -94,6 +96,7 @@ impl DocPane {
             find_input,
             path: None,
             document: None,
+            stats: None,
             source: false,
             properties: false,
             help: false,
@@ -188,9 +191,12 @@ impl DocPane {
             self.history.push(path.clone());
             self.history_index = self.history.len() - 1;
         }
-        let task = cx
-            .background_executor()
-            .spawn(async move { markdown_core::read_document(&path) });
+        let task = cx.background_executor().spawn(async move {
+            markdown_core::read_document(&path).map(|doc| {
+                let stats = doc.stats();
+                (doc, stats)
+            })
+        });
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -200,13 +206,15 @@ impl DocPane {
                 this.loading = false;
                 match result {
                     // set_text preserves unchanged block identities and scroll on refresh.
-                    Ok(doc) => {
+                    Ok((doc, stats)) => {
                         this.document = Some(doc);
+                        this.stats = Some(stats);
                         this.present(cx);
                     }
                     Err(e) => {
                         this.error = Some(e);
                         this.document = None;
+                        this.stats = None;
                         this.text.update(cx, |s, cx| s.set_text("# Unable to read this file\n\nCheck that it still exists and is readable, then press **⌘R** to retry.", cx));
                     }
                 }
@@ -577,8 +585,9 @@ impl Render for DocPane {
                 div()
                     .flex_1()
                     .min_h_0()
+                    // Only sideways: the page scrolls right up to the tab
+                    // bar instead of vanishing under an empty band.
                     .px(px(32.))
-                    .py(px(24.))
                     .text_size(px(font_size))
                     .line_height(relative(1.65))
                     .child(if self.loading && self.document.is_none() {

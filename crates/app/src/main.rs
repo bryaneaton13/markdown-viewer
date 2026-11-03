@@ -1,8 +1,10 @@
 mod actions;
 mod chrome;
 mod files;
+mod info;
 mod names;
 mod pane;
+mod pet;
 mod preferences;
 mod reader;
 mod sidebar;
@@ -146,9 +148,24 @@ fn screenshot(cx: &mut App) {
             });
             window.refresh();
         });
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(700))
-            .await;
+        // Images decode and popovers measure over a few frames; a busy
+        // machine may need longer (MARKDOWN_VIEWER_SHOT_DELAY, in ms).
+        let settle = std::env::var("MARKDOWN_VIEWER_SHOT_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(700);
+        // Draw a few frames ourselves: a window on another Space or behind a
+        // full-screen app gets no display-link frames, and popovers place
+        // themselves from the previous frame's layout.
+        for _ in 0..4 {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(settle / 4))
+                .await;
+            let _ = cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        }
         // Draw now rather than trusting the last frame: an occluded or
         // unattended window may not have repainted since launch.
         let result = cx.update_window(window.into(), |_, window, cx| {

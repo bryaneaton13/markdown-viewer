@@ -9,8 +9,9 @@
 use crate::{
     actions::*,
     chrome::{self, Palette},
-    files, names,
+    files, info, names,
     pane::{DocPane, FontSize, PaneEvent},
+    pet::Nib,
     preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
     sidebar::{self, Item, Sort},
     tabs::{Tab, TabSet},
@@ -207,6 +208,10 @@ pub struct Reader {
     _appearance: Option<Subscription>,
     /// The toolbar's appearance panel is open.
     appearance_open: bool,
+    /// The footer's document info panel is open.
+    info_open: bool,
+    /// Nib, alive only while that panel is open.
+    nib: Option<Entity<Nib>>,
 }
 
 impl Reader {
@@ -257,6 +262,8 @@ impl Reader {
             _watch_task: None,
             _appearance: Some(appearance),
             appearance_open: false,
+            info_open: false,
+            nib: None,
             prefs,
         };
         let saved = std::mem::take(&mut this.prefs.workspaces);
@@ -3009,14 +3016,91 @@ impl Reader {
             } else {
                 "MARKDOWN · READ ONLY"
             })
-            .child(format!(
-                "{}   ·   {} pt",
-                pane.document
-                    .as_ref()
-                    .map(|d| format!("{} words", d.body.split_whitespace().count()))
-                    .unwrap_or("Local files".into()),
-                self.prefs.font_size
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(match pane.stats.clone().filter(|_| !pane.help) {
+                        Some(stats) => self.info_button(stats, cx).into_any_element(),
+                        None => div().child("Local files").into_any_element(),
+                    })
+                    .child(format!("·   {} pt", self.prefs.font_size)),
+            )
+    }
+
+    /// The footer's word count, which opens what the document is made of.
+    fn set_info_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.info_open = open;
+        self.nib = open.then(|| {
+            let mood = self
+                .focused_pane()
+                .read(cx)
+                .stats
+                .as_ref()
+                .map(info::mood)
+                .unwrap_or_default();
+            cx.new(|cx| Nib::new(mood, cx))
+        });
+        cx.notify();
+    }
+
+    fn info_button(&self, stats: markdown_core::Stats, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let (_, fg) = Self::status_colors(cx);
+        let label = format!(
+            "{} words · {} min",
+            info::thousands(stats.words),
+            stats.reading_minutes()
+        );
+        Popover::new("doc-info")
+            .anchor(Anchor::BottomRight)
+            .open(self.info_open)
+            .on_open_change({
+                let weak = weak.clone();
+                move |open, _, cx| {
+                    let _ = weak.update(cx, |v, cx| v.set_info_open(*open, cx));
+                }
+            })
+            .trigger(
+                // Drawn in the status bar's own colors: a fun theme's bar
+                // can be dark under a light chrome.
+                Button::new("doc-info-button")
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .foreground(fg)
+                            .hover(fg.opacity(0.12))
+                            .active(fg.opacity(0.18)),
+                    )
+                    .xsmall()
+                    .label(label)
+                    .tooltip("What's in this document"),
+            )
+            .content(move |_, _, cx| {
+                let Some(view) = weak.upgrade() else {
+                    return div().into_any_element();
+                };
+                let pane = view.read(cx).focused_pane();
+                let pane = pane.read(cx);
+                let (Some(stats), Some(doc)) = (pane.stats.as_ref(), pane.document.as_ref()) else {
+                    return div().into_any_element();
+                };
+                let nib = view
+                    .read(cx)
+                    .nib
+                    .clone()
+                    .map(|n| n.into_any_element())
+                    .unwrap_or_else(|| div().into_any_element());
+                let weak = weak.clone();
+                let jump = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |v, cx| {
+                        v.set_info_open(false, cx);
+                        v.with_pane(cx, |p, cx| p.jump_heading(index, cx));
+                        v.focus_reader(window, cx);
+                    });
+                });
+                info::panel(stats, &doc.headings, jump, nib, cx)
+            })
     }
 
     fn picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3028,13 +3112,18 @@ impl Reader {
                 .document
                 .as_ref()
                 .map(|d| {
+                    // Indent from the shallowest level used, not from `#`.
+                    let top = d.headings.iter().map(|h| h.level).min().unwrap_or(1);
                     d.headings
                         .iter()
                         .enumerate()
                         .map(|(index, h)| {
+                            let heading = h.clone();
                             CommandItem::new()
                                 .label(h.text.clone())
+                                .keywords([format!("h{}", h.level)])
                                 .action(Box::new(JumpHeading { index }))
+                                .child(move |_, cx| info::heading_row(&heading, top, cx))
                         })
                         .collect()
                 })
@@ -3069,7 +3158,9 @@ impl Reader {
             .inset_0()
             .flex()
             .justify_center()
-            .pt(px(80.))
+            // Top-aligned, so the panel is only as tall as its rows.
+            .items_start()
+            .pt(px(64.))
             .bg(rgba(0x00000035))
             .on_mouse_down(MouseButton::Left, move |_, w, cx| {
                 let _ = dismiss.update(cx, |v, cx| v.close_overlay(w, cx));
@@ -3079,9 +3170,8 @@ impl Reader {
                     .w(px(570.))
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .rounded_xl()
-                    .overflow_hidden()
-                    .shadow_md()
+                    .rounded_lg()
+                    .shadow_lg()
                     .child(
                         Command::new(&self.palette)
                             .placeholder(if outline {
@@ -3089,7 +3179,8 @@ impl Reader {
                             } else {
                                 "Find a Markdown file…"
                             })
-                            .max_h(px(320.))
+                            .bordered(true)
+                            .max_h(px(380.))
                             .empty(move |_, _, cx| {
                                 div()
                                     .py_6()
@@ -3110,16 +3201,23 @@ impl Reader {
                                 let _ = cancel.update(cx, |v, cx| v.close_overlay(w, cx));
                             })
                             .footer(move |_, _, cx| {
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if outline {
-                                        "↑ ↓ Navigate    ↵ Jump    Esc Close"
-                                    } else {
-                                        "↑ ↓ Navigate    ↵ Open    ⌘↵ New tab    ⌥↵ Split    Esc Close"
-                                    })
+                                if outline {
+                                    info::key_hints(
+                                        &[("↑ ↓", "Navigate"), ("↵", "Jump"), ("Esc", "Close")],
+                                        cx,
+                                    )
+                                } else {
+                                    info::key_hints(
+                                        &[
+                                            ("↑ ↓", "Navigate"),
+                                            ("↵", "Open"),
+                                            ("⌘ ↵", "New tab"),
+                                            ("⌥ ↵", "Split"),
+                                            ("Esc", "Close"),
+                                        ],
+                                        cx,
+                                    )
+                                }
                             }),
                     ),
             )
@@ -3195,6 +3293,12 @@ impl Reader {
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(false, window, cx),
                 "appearance" => self.appearance_open = true,
+                "info" => self.set_info_open(true, cx),
+                "nib" => {
+                    if let Some(nib) = &self.nib {
+                        nib.update(cx, |n, _| n.pose(arg));
+                    }
+                }
                 "outline" => self.open_picker(true, window, cx),
                 "find" => {
                     let pane = self.focused_pane();
