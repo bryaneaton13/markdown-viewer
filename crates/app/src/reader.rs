@@ -18,10 +18,12 @@ use crate::{
 };
 use gpui_kit::{
     assets::IconName as Lucide,
+    base::TestSupportExt,
     component::{
         button::*,
         command::{Command, CommandGroup, CommandItem, CommandState},
         menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+        popover::Popover,
         resizable::{ResizableState, h_resizable, resizable_panel},
         tooltip::Tooltip,
         *,
@@ -203,6 +205,8 @@ pub struct Reader {
     _watch: Option<notify::RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
     _appearance: Option<Subscription>,
+    /// The toolbar's appearance panel is open.
+    appearance_open: bool,
 }
 
 impl Reader {
@@ -252,6 +256,7 @@ impl Reader {
             _watch: None,
             _watch_task: None,
             _appearance: Some(appearance),
+            appearance_open: false,
             prefs,
         };
         let saved = std::mem::take(&mut this.prefs.workspaces);
@@ -1504,65 +1509,111 @@ impl Reader {
         self.prefs.save();
     }
 
-    /// The toolbar's appearance menu: light, dark or system, and the chrome
-    /// color presets, each with a swatch.
-    fn appearance_menu(menu: PopupMenu, weak: WeakEntity<Self>, cx: &App) -> PopupMenu {
-        let (dark, palette) = weak
-            .upgrade()
-            .map(|v| {
-                let prefs = &v.read(cx).prefs;
-                (prefs.dark, prefs.palette)
-            })
-            .unwrap_or_default();
-        let mut menu = menu.min_w(px(210.)).label("Appearance");
+    /// The toolbar's appearance panel: light, dark or system, and the
+    /// themes, each with its colors. It stays open while you try them;
+    /// a click outside or Escape closes it.
+    fn appearance_panel(weak: &WeakEntity<Self>, cx: &App) -> AnyElement {
+        let Some(view) = weak.upgrade() else {
+            return div().into_any_element();
+        };
+        let (dark, palette) = {
+            let prefs = &view.read(cx).prefs;
+            (prefs.dark, prefs.palette)
+        };
+        let theme = cx.theme();
+        let (hover, muted) = (theme.accent, theme.muted_foreground);
+        let heading = |label: &'static str| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_sm()
+                .text_color(muted)
+                .child(label)
+        };
+        let row = |id: SharedString, checked: bool, content: AnyElement| {
+            div()
+                .id(id)
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(
+                    div()
+                        .w(px(14.))
+                        .flex_shrink_0()
+                        .when(checked, |d| d.child(Icon::new(IconName::Check).small())),
+                )
+                .child(content)
+        };
+        let mut panel = div()
+            .w(px(220.))
+            .flex()
+            .flex_col()
+            .child(heading("Appearance"));
         for (label, value) in [
             ("Light", Some(false)),
             ("Dark", Some(true)),
             ("Match System", None),
         ] {
             let weak = weak.clone();
-            menu = menu.item(PopupMenuItem::new(label).checked(dark == value).on_click(
-                move |_, window, cx| {
+            panel = panel.child(
+                row(
+                    format!("appearance-{label}").into(),
+                    dark == value,
+                    div().child(label).into_any_element(),
+                )
+                .on_click(move |_, window, cx| {
                     let _ = weak.update(cx, |v, cx| v.set_appearance(value, window, cx));
-                },
-            ));
+                })
+                .test_support(),
+            );
         }
         for (group, options) in [
             ("Editor Themes", &Palette::EDITOR[..]),
             ("Fun Themes", &Palette::FUN[..]),
         ] {
-            menu = menu.separator().label(group);
+            panel = panel
+                .child(div().my_1().h(px(1.)).bg(theme.border))
+                .child(heading(group));
             for &option in options {
+                // Overlapping dots, one per color the theme adds.
+                let mut dots = div().flex().items_center().w(px(26.)).flex_shrink_0();
+                for (i, color) in option.swatches(cx).into_iter().enumerate() {
+                    dots = dots.child(
+                        div()
+                            .size(px(10.))
+                            .rounded_full()
+                            .bg(color)
+                            .when(i > 0, |d| d.ml(px(-3.))),
+                    );
+                }
                 let weak = weak.clone();
-                let swatches = option.swatches(cx);
-                menu = menu.item(
-                    PopupMenuItem::element(move |_, _| {
-                        // Overlapping dots, one per color the theme adds.
-                        let mut dots = div().flex().items_center().w(px(26.));
-                        for (i, &color) in swatches.iter().enumerate() {
-                            dots = dots.child(
-                                div()
-                                    .size(px(10.))
-                                    .rounded_full()
-                                    .bg(color)
-                                    .when(i > 0, |d| d.ml(px(-3.))),
-                            );
-                        }
+                panel = panel.child(
+                    row(
+                        format!("palette-{}", option.label()).into(),
+                        option == palette,
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
                             .child(dots)
                             .child(option.label())
-                    })
-                    .checked(option == palette)
+                            .into_any_element(),
+                    )
                     .on_click(move |_, window, cx| {
                         let _ = weak.update(cx, |v, cx| v.set_palette(option, window, cx));
-                    }),
+                    })
+                    .test_support(),
                 );
             }
         }
-        menu
+        panel.into_any_element()
     }
 
     // MARK: Rendering
@@ -1731,13 +1782,25 @@ impl Reader {
                             })),
                     )
                     .child(
-                        Button::new("theme")
-                            .ghost()
-                            .icon(Icon::new(Lucide::Palette))
-                            .tooltip("Appearance & colors · ⇧⌘D toggles dark")
-                            .dropdown_menu(move |menu, _, cx| {
-                                Self::appearance_menu(menu, weak.clone(), cx)
-                            }),
+                        Popover::new("appearance")
+                            .anchor(Anchor::TopRight)
+                            .open(self.appearance_open)
+                            .on_open_change({
+                                let weak = weak.clone();
+                                move |open, _, cx| {
+                                    let _ = weak.update(cx, |v, cx| {
+                                        v.appearance_open = *open;
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .trigger(
+                                Button::new("theme")
+                                    .ghost()
+                                    .icon(Icon::new(Lucide::Palette))
+                                    .tooltip("Appearance & themes · ⇧⌘D toggles dark"),
+                            )
+                            .content(move |_, _, cx| Self::appearance_panel(&weak, cx)),
                     )
                     .child(
                         Button::new("help")
@@ -3131,6 +3194,7 @@ impl Reader {
                 "source" => self.with_pane(cx, |p, cx| p.toggle_source(cx)),
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(false, window, cx),
+                "appearance" => self.appearance_open = true,
                 "outline" => self.open_picker(true, window, cx),
                 "find" => {
                     let pane = self.focused_pane();
@@ -3960,6 +4024,26 @@ mod tests {
             v.set_appearance(Some(false), w, cx);
         });
         assert_eq!(colors(cx), (page, sidebar, toolbar, tabs, status, code));
+    }
+
+    #[gpui_kit::test]
+    fn appearance_panel_stays_open_while_trying_themes(cx: &mut TestAppContext) {
+        let (w, view) = open(cx);
+        interact(w, cx, |w, cx| w.click("theme", cx));
+        interact(w, cx, |_, _| {});
+        interact(w, cx, |_, _| {});
+        interact(w, cx, |w, cx| w.click("palette-Synthwave", cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.prefs.palette),
+            Palette::Synthwave
+        );
+        // Still open: the next row is there to click without reopening.
+        interact(w, cx, |w, cx| {
+            w.click("palette-Lagoon", cx);
+            w.click("appearance-Dark", cx);
+        });
+        let prefs = view.read_with(cx, |v, _| (v.prefs.palette, v.prefs.dark));
+        assert_eq!(prefs, (Palette::Lagoon, Some(true)));
     }
 
     #[gpui_kit::test]
