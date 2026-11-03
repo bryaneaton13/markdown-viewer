@@ -8,8 +8,10 @@
 
 use crate::{
     actions::*,
-    files,
+    chrome::{self, Palette},
+    files, info, names,
     pane::{DocPane, FontSize, PaneEvent},
+    pet::Nib,
     preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
     sidebar::{self, Item, Sort},
     tabs::{Tab, TabSet},
@@ -17,11 +19,14 @@ use crate::{
 };
 use gpui_kit::{
     assets::IconName as Lucide,
+    base::TestSupportExt,
     component::{
         button::*,
         command::{Command, CommandGroup, CommandItem, CommandState},
         menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+        popover::Popover,
         resizable::{ResizableState, h_resizable, resizable_panel},
+        tooltip::Tooltip,
         *,
     },
     prelude::FluentBuilder,
@@ -29,7 +34,7 @@ use gpui_kit::{
 };
 use notify::Watcher;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
@@ -52,7 +57,13 @@ const EDGE_MAX: f32 = 240.;
 /// Where a file opens.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Target {
-    /// Replace the focused pane's document.
+    /// A single click in the sidebar: the tab already showing it, else the
+    /// preview tab (or an empty one), else a new preview tab.
+    Preview,
+    /// Like `Preview`, then keep that tab open: a double-click, ↵, Quick
+    /// Open, or a file opened from Finder.
+    Keep,
+    /// Replace the focused pane's document, keeping its tab open.
     Focused,
     /// A new tab beside the active one.
     NewTab,
@@ -194,22 +205,25 @@ pub struct Reader {
     watched: Vec<(PathBuf, bool)>,
     _watch: Option<notify::RecommendedWatcher>,
     _watch_task: Option<Task<()>>,
+    _appearance: Option<Subscription>,
+    /// The toolbar's appearance panel is open.
+    appearance_open: bool,
+    /// The footer's document info panel is open.
+    info_open: bool,
+    /// Nib, alive only while that panel is open.
+    nib: Option<Entity<Nib>>,
 }
 
 impl Reader {
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let prefs = Preferences::load();
-        if let Some(dark) = prefs.dark {
-            Theme::change(
-                if dark {
-                    ThemeMode::Dark
-                } else {
-                    ThemeMode::Light
-                },
-                Some(window),
-                cx,
-            );
-        }
+        chrome::apply(Self::mode(prefs.dark, window), prefs.palette, cx);
+        // "Match System" follows the Mac's appearance as it changes.
+        let appearance = cx.observe_window_appearance(window, |this, window, cx| {
+            if this.prefs.dark.is_none() {
+                this.apply_theme(window, cx);
+            }
+        });
         cx.set_global(FontSize(prefs.font_size));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
@@ -224,6 +238,7 @@ impl Reader {
                     .map(|r| Self::make_pane(Some(r), window, cx));
                 tab.focus_right = t.focus_right && tab.right.is_some();
                 tab.pinned = t.pinned;
+                tab.preview = t.preview && !t.pinned && tab.right.is_none();
                 tab
             })
             .collect();
@@ -245,6 +260,10 @@ impl Reader {
             watched: Vec::new(),
             _watch: None,
             _watch_task: None,
+            _appearance: Some(appearance),
+            appearance_open: false,
+            info_open: false,
+            nib: None,
             prefs,
         };
         let saved = std::mem::take(&mut this.prefs.workspaces);
@@ -395,11 +414,57 @@ impl Reader {
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_in(path, Target::Keep, window, cx);
+    }
+
+    /// Open `path` in the preview tab, the way a single click in the
+    /// sidebar does, and return the tab it landed in. A tab already showing
+    /// it comes forward instead; an empty tab is used before a new one.
+    fn open_preview(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         if self.show_existing(&path, window, cx) {
-        } else if self.focused_pane().read(cx).is_blank() {
-            self.open_in(path, Target::Focused, window, cx);
-        } else {
-            self.open_in(path, Target::NewTab, window, cx);
+            return self.tabs.active;
+        }
+        let blank = (!self.tab().is_split() && self.focused_pane().read(cx).is_blank())
+            .then_some(self.tabs.active);
+        match self.tabs.preview_index().or(blank) {
+            Some(ix) => {
+                self.tabs.activate(ix);
+                let tab = self.tabs.active_mut();
+                tab.preview = !tab.pinned;
+                let pane = tab.left.clone();
+                pane.update(cx, |p, cx| p.load_file(path, true, cx));
+            }
+            None => {
+                let pane = Self::make_pane(None, window, cx);
+                pane.update(cx, |p, cx| p.load_file(path, true, cx));
+                self.tabs.insert_after_active(Tab::preview(pane));
+            }
+        }
+        self.after_tab_change(window, cx);
+        self.tabs.active
+    }
+
+    /// Keep the preview tab showing `path` open, as a double-click does.
+    fn keep_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let showing = self
+            .tabs
+            .tabs
+            .iter()
+            .position(|t| t.preview && t.left.read(cx).path.as_deref() == Some(path));
+        if let Some(ix) = showing {
+            self.keep_tab(ix, cx);
+        }
+    }
+
+    fn keep_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.tabs.keep(ix) {
+            self.save(cx);
+            cx.notify();
         }
     }
 
@@ -431,13 +496,10 @@ impl Reader {
         cx: &mut Context<Self>,
     ) {
         self.set_active(ws, cx);
-        if target == Target::Focused && self.show_existing(&path, window, cx) {
-            return;
-        }
         self.open_in(path, target, window, cx);
     }
 
-    /// Open a file from the tree or Quick Open.
+    /// Open a file from the tree, Quick Open, Finder or a drop.
     pub fn open_in(
         &mut self,
         path: PathBuf,
@@ -449,8 +511,16 @@ impl Reader {
             pane.update(cx, |p, cx| p.load_file(path.clone(), true, cx))
         };
         match target {
+            Target::Preview => {
+                self.open_preview(path, window, cx);
+            }
+            Target::Keep => {
+                let ix = self.open_preview(path, window, cx);
+                self.keep_tab(ix, cx);
+            }
             Target::Focused => {
                 load(&self.focused_pane(), cx);
+                self.tabs.active_mut().preview = false;
                 self.after_tab_change(window, cx);
             }
             Target::NewTab => {
@@ -1132,6 +1202,7 @@ impl Reader {
                 right: t.right.as_ref().map(|p| p.read(cx).to_saved()),
                 focus_right: t.focus_right,
                 pinned: t.pinned,
+                preview: t.preview,
             })
             .collect();
         self.prefs.active_tab = self.tabs.active;
@@ -1276,7 +1347,8 @@ impl Reader {
     }
 
     /// ↑ / ↓ across every open workspace. Landing on a file in the active
-    /// workspace previews it; other workspaces wait for ↵ or a click.
+    /// workspace previews it in the preview tab; other workspaces wait for
+    /// ↵ or a click.
     fn tree_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         let items = self.layout();
         if items.is_empty() {
@@ -1301,7 +1373,7 @@ impl Reader {
         if item.ws() == self.active
             && let Some(row) = self.row(item).filter(|r| !r.directory).cloned()
         {
-            self.open_from_tree(item.ws(), row.path, Target::Focused, window, cx);
+            self.open_from_tree(item.ws(), row.path, Target::Preview, window, cx);
         }
         cx.notify();
     }
@@ -1316,7 +1388,8 @@ impl Reader {
         cx.notify();
     }
 
-    /// ↵ or a click: open or close a folder, or open a file.
+    /// ↵ or a click: open or close a folder, or open a file (a click
+    /// previews it; ↵ keeps it open).
     fn tree_open(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let items = self.layout();
         let Some(ix) = self.cursor_index(&items, cx) else {
@@ -1416,6 +1489,140 @@ impl Reader {
         cx.notify();
     }
 
+    /// Light or dark: the saved choice, else the system's.
+    fn mode(dark: Option<bool>, window: &Window) -> ThemeMode {
+        match dark {
+            Some(true) => ThemeMode::Dark,
+            Some(false) => ThemeMode::Light,
+            None => window.appearance().into(),
+        }
+    }
+
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        chrome::apply(Self::mode(self.prefs.dark, window), self.prefs.palette, cx);
+        cx.notify();
+    }
+
+    /// Light (`Some(false)`), dark (`Some(true)`) or match the system (`None`).
+    fn set_appearance(&mut self, dark: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefs.dark = dark;
+        self.apply_theme(window, cx);
+        self.prefs.save();
+    }
+
+    fn set_palette(&mut self, palette: Palette, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefs.palette = palette;
+        self.apply_theme(window, cx);
+        self.prefs.save();
+    }
+
+    /// The toolbar's appearance panel: light, dark or system, and the
+    /// themes, each with its colors. It stays open while you try them;
+    /// a click outside or Escape closes it.
+    fn appearance_panel(weak: &WeakEntity<Self>, cx: &App) -> AnyElement {
+        let Some(view) = weak.upgrade() else {
+            return div().into_any_element();
+        };
+        let (dark, palette) = {
+            let prefs = &view.read(cx).prefs;
+            (prefs.dark, prefs.palette)
+        };
+        let theme = cx.theme();
+        let (hover, muted) = (theme.accent, theme.muted_foreground);
+        let heading = |label: &'static str| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_sm()
+                .text_color(muted)
+                .child(label)
+        };
+        let row = |id: SharedString, checked: bool, content: AnyElement| {
+            div()
+                .id(id)
+                .h(px(30.))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(
+                    div()
+                        .w(px(14.))
+                        .flex_shrink_0()
+                        .when(checked, |d| d.child(Icon::new(IconName::Check).small())),
+                )
+                .child(content)
+        };
+        let mut panel = div()
+            .w(px(220.))
+            .flex()
+            .flex_col()
+            .child(heading("Appearance"));
+        for (label, value) in [
+            ("Light", Some(false)),
+            ("Dark", Some(true)),
+            ("Match System", None),
+        ] {
+            let weak = weak.clone();
+            panel = panel.child(
+                row(
+                    format!("appearance-{label}").into(),
+                    dark == value,
+                    div().child(label).into_any_element(),
+                )
+                .on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |v, cx| v.set_appearance(value, window, cx));
+                })
+                .test_support(),
+            );
+        }
+        for (group, options) in [
+            ("Editor Themes", &Palette::EDITOR[..]),
+            ("Fun Themes", &Palette::FUN[..]),
+        ] {
+            panel = panel
+                .child(div().my_1().h(px(1.)).bg(theme.border))
+                .child(heading(group));
+            for &option in options {
+                // Overlapping dots, one per color the theme adds.
+                let mut dots = div().flex().items_center().w(px(26.)).flex_shrink_0();
+                for (i, color) in option.swatches(cx).into_iter().enumerate() {
+                    dots = dots.child(
+                        div()
+                            .size(px(10.))
+                            .rounded_full()
+                            .bg(color)
+                            .when(i > 0, |d| d.ml(px(-3.))),
+                    );
+                }
+                let weak = weak.clone();
+                panel = panel.child(
+                    row(
+                        format!("palette-{}", option.label()).into(),
+                        option == palette,
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(dots)
+                            .child(option.label())
+                            .into_any_element(),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |v, cx| v.set_palette(option, window, cx));
+                    })
+                    .test_support(),
+                );
+            }
+        }
+        panel.into_any_element()
+    }
+
     // MARK: Rendering
 
     fn toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1429,14 +1636,33 @@ impl Reader {
             Some(path) => self.home_of(path),
             None => Some(self.active),
         };
-        let workspace = home
-            .and_then(|ix| self.workspaces[ix].root.as_deref())
-            .map(|root| name_of(Some(root)));
+        let root = home.and_then(|ix| self.workspaces[ix].root.as_deref());
+        let workspace = root.map(|root| name_of(Some(root)));
+        // The folders between the workspace and the file: a breadcrumb.
+        let crumbs: Vec<String> = match (&pane.path, root) {
+            (Some(path), Some(root)) if !help => path
+                .parent()
+                .and_then(|p| p.strip_prefix(root).ok())
+                .map(|rel| {
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            (Some(path), None) if !help => path
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|n| vec![n.to_string_lossy().into_owned()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let full_path = pane.path.as_deref().filter(|_| !help).map(names::tilde);
+        let weak = cx.entity().downgrade();
         // 44px toolbar doubles as the title bar; traffic lights are centered in it (main.rs).
         TitleBar::new()
             .h(px(TOOLBAR_HEIGHT))
-            .bg(theme.background)
-            .border_color(theme.border)
+            .bg(theme.title_bar)
+            .border_color(theme.sidebar_border)
             .when(window.is_fullscreen(), |d| d.pl_2())
             .child(
                 div()
@@ -1474,6 +1700,7 @@ impl Reader {
                     )
                     .child(
                         div()
+                            .id("breadcrumb")
                             .flex_1()
                             .min_w_0()
                             .flex()
@@ -1483,7 +1710,11 @@ impl Reader {
                             .font_weight(FontWeight::MEDIUM)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            // Which workspace the document belongs to.
+                            .when_some(full_path, |d, path| {
+                                d.tooltip(move |w, cx| Tooltip::new(path.clone()).build(w, cx))
+                            })
+                            // Which workspace the document belongs to, and
+                            // the folders down to it.
                             .when_some(workspace, |d, name| {
                                 d.child(
                                     div()
@@ -1492,7 +1723,16 @@ impl Reader {
                                         .child(format!("{name}  /")),
                                 )
                             })
-                            .child(div().min_w_0().truncate().child(
+                            .when(!crumbs.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .min_w(px(24.))
+                                        .truncate()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{}  /", crumbs.join("  /  "))),
+                                )
+                            })
+                            .child(div().flex_shrink_0().max_w(px(360.)).truncate().child(
                                 if pane.path.is_some() || help {
                                     pane.title()
                                 } else {
@@ -1549,13 +1789,25 @@ impl Reader {
                             })),
                     )
                     .child(
-                        Button::new("theme")
-                            .ghost()
-                            .icon(IconName::Sun)
-                            .tooltip("Toggle theme · ⇧⌘D")
-                            .on_click(cx.listener(|_, _, w, cx| {
-                                w.dispatch_action(Box::new(ToggleTheme), cx)
-                            })),
+                        Popover::new("appearance")
+                            .anchor(Anchor::TopRight)
+                            .open(self.appearance_open)
+                            .on_open_change({
+                                let weak = weak.clone();
+                                move |open, _, cx| {
+                                    let _ = weak.update(cx, |v, cx| {
+                                        v.appearance_open = *open;
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .trigger(
+                                Button::new("theme")
+                                    .ghost()
+                                    .icon(Icon::new(Lucide::Palette))
+                                    .tooltip("Appearance & themes · ⇧⌘D toggles dark"),
+                            )
+                            .content(move |_, _, cx| Self::appearance_panel(&weak, cx)),
                     )
                     .child(
                         Button::new("help")
@@ -1637,6 +1889,41 @@ impl Reader {
             )
     }
 
+    /// Actions on one file, for the sidebar's and the tab strip's context
+    /// menus. `open` adds the ways to open it.
+    fn file_menu_items(
+        menu: PopupMenu,
+        path: PathBuf,
+        open: bool,
+        weak: WeakEntity<Self>,
+    ) -> PopupMenu {
+        let item =
+            |label: &'static str, f: fn(&mut Reader, &Path, &mut Window, &mut Context<Reader>)| {
+                let (weak, path) = (weak.clone(), path.clone());
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |v, cx| f(v, &path, window, cx));
+                })
+            };
+        let menu = if open {
+            menu.item(item("Open", |v, p, w, cx| {
+                v.open_in(p.to_owned(), Target::Keep, w, cx)
+            }))
+            .item(item("Open in New Tab", |v, p, w, cx| {
+                v.open_in(p.to_owned(), Target::NewTab, w, cx)
+            }))
+            .item(item("Open to the Side", |v, p, w, cx| {
+                v.open_in(p.to_owned(), Target::Split, w, cx)
+            }))
+            .separator()
+        } else {
+            menu
+        };
+        menu.item(item("Reveal in Finder", |_, p, _, cx| cx.reveal_path(p)))
+            .item(item("Copy Path", |_, p, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()))
+            }))
+    }
+
     /// Actions for one workspace, from its ⋯ button or a right-click.
     fn workspace_menu(
         menu: PopupMenu,
@@ -1686,6 +1973,9 @@ impl Reader {
         let theme = cx.theme();
         let (hover, accent, ring) = (theme.sidebar_accent, theme.sidebar_accent, theme.ring);
         let muted = theme.muted_foreground;
+        let accents = chrome::accents(cx);
+        let folder_color = accents.folder.unwrap_or(muted);
+        let file_color = accents.file.unwrap_or(muted);
         let cursor = keyboard == Some(ix);
         let current = self.focused_pane().read(cx).path.clone();
         let row = div()
@@ -1736,6 +2026,8 @@ impl Reader {
                         .flex_shrink_0()
                         .text_color(if active {
                             theme.primary
+                        } else if folder {
+                            folder_color
                         } else {
                             muted
                         }),
@@ -1745,7 +2037,7 @@ impl Reader {
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .items_baseline()
+                            .items_center()
                             .gap_1p5()
                             .whitespace_nowrap()
                             .child(
@@ -1803,7 +2095,11 @@ impl Reader {
                                     }),
                             ),
                     )
-                    .on_click(cx.listener(move |v, _, _, cx| {
+                    .on_click(cx.listener(move |v, e: &ClickEvent, _, cx| {
+                        // A double-click opens and stays open.
+                        if e.click_count() > 1 {
+                            return;
+                        }
                         v.cursor = Some(Cursor { ws: w, path: None });
                         v.toggle_open(w, cx);
                     }))
@@ -1833,10 +2129,19 @@ impl Reader {
                     })
                     .into_any_element()
             }
-            Item::Entry { ws, .. } => {
+            Item::Entry { ws, row: row_ix } => {
                 let Some(entry) = self.row(item) else {
                     return div().id(("entry", ix)).into_any_element();
                 };
+                // Loose files have no tree around them: name their folder.
+                let hint = (self.workspaces[ws].root.is_none())
+                    .then(|| {
+                        let rows = &self.workspaces[ws].rows;
+                        let paths: Vec<&Path> = rows.iter().map(|r| r.path.as_path()).collect();
+                        names::disambiguate(&paths, true).swap_remove(row_ix)
+                    })
+                    .flatten();
+                let (menu_weak, menu_path) = (cx.entity().downgrade(), entry.path.clone());
                 let selected = current.as_ref() == Some(&entry.path);
                 let directory = entry.directory;
                 let icon = if !directory {
@@ -1864,9 +2169,14 @@ impl Reader {
                         d.bg(accent).text_color(theme.sidebar_accent_foreground)
                     })
                     .when(!selected, |d| d.hover(move |s| s.bg(hover)))
-                    .child(Icon::new(icon).size_4().flex_shrink_0().text_color(muted))
                     .child(
-                        div().min_w_0().truncate().child(
+                        Icon::new(icon)
+                            .size_4()
+                            .flex_shrink_0()
+                            .text_color(if directory { folder_color } else { file_color }),
+                    )
+                    .child(
+                        div().flex_shrink_0().max_w(px(170.)).truncate().child(
                             entry
                                 .path
                                 .file_name()
@@ -1875,6 +2185,16 @@ impl Reader {
                                 .into_owned(),
                         ),
                     )
+                    .when_some(hint, |d, hint| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(hint),
+                        )
+                    })
                     .on_click(cx.listener(move |v, e: &ClickEvent, w, cx| {
                         let m = e.modifiers();
                         let target = if m.platform {
@@ -1882,8 +2202,16 @@ impl Reader {
                         } else if m.alt {
                             Target::Split
                         } else {
-                            Target::Focused
+                            Target::Preview
                         };
+                        // The first click of a double-click already opened
+                        // the file (or folder); the second keeps it open.
+                        if e.click_count() > 1 {
+                            if target == Target::Preview && !directory {
+                                v.keep_path(&path, cx);
+                            }
+                            return;
+                        }
                         v.cursor = Some(Cursor {
                             ws,
                             path: Some(path.clone()),
@@ -1894,6 +2222,14 @@ impl Reader {
                     // Drag a file onto the page to open or split it there.
                     .when_some(drag, |d, (payload, name)| {
                         d.on_drag(payload, move |_, _, _, cx| cx.new(|_| Ghost(name.clone())))
+                    })
+                    .context_menu(move |menu, _, _| {
+                        Self::file_menu_items(
+                            menu,
+                            menu_path.clone(),
+                            !directory,
+                            menu_weak.clone(),
+                        )
                     })
                     .into_any_element()
             }
@@ -1931,11 +2267,11 @@ impl Reader {
             .flex()
             .flex_col()
             .border_r_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
             // Folders dropped here become workspaces; files open in theirs.
             .drag_over::<ExternalPaths>({
-                let accent = cx.theme().accent;
+                let accent = cx.theme().sidebar_accent;
                 move |style, paths: &ExternalPaths, _, _| {
                     let (files, dirs) = droppable(paths.paths());
                     if files.is_empty() && dirs.is_empty() {
@@ -2001,13 +2337,19 @@ impl Reader {
             .child(
                 div()
                     .px_4()
-                    .py_3()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
                     .border_t_1()
-                    .border_color(cx.theme().border)
+                    .border_color(cx.theme().sidebar_border)
+                    // A fun theme's status bar runs under the sidebar too.
+                    .bg(chrome::accents(cx)
+                        .status
+                        .map_or(cx.theme().sidebar, |(bg, _)| bg))
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .truncate()
-                    .child(if ws.indexing {
+                    .text_color(Self::status_colors(cx).1)
+                    .child(div().min_w_0().truncate().child(if ws.indexing {
                         format!("{} · Indexing…", ws.name())
                     } else if ws.root.is_none() {
                         match ws.rows.len() {
@@ -2022,25 +2364,78 @@ impl Reader {
                             ws.files.len(),
                             if ws.limited { " · limit reached" } else { "" }
                         )
-                    }),
+                    })),
             )
     }
 
-    fn tab_label(tab: &Tab<Entity<DocPane>>, cx: &App) -> String {
-        match &tab.right {
-            Some(right) => format!(
-                "{}  |  {}",
-                tab.left.read(cx).title(),
-                right.read(cx).title()
-            ),
-            None => tab.left.read(cx).title(),
-        }
+    /// Folder hints for open documents that share a file name, so two
+    /// `README.md` tabs read `README.md  notes` and `README.md  tools`.
+    fn hints(&self, cx: &App) -> HashMap<PathBuf, String> {
+        let paths: Vec<PathBuf> = self
+            .tabs
+            .panes()
+            .filter_map(|p| p.read(cx).path.clone())
+            .collect();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        paths
+            .iter()
+            .cloned()
+            .zip(names::disambiguate(&refs, false))
+            .filter_map(|(path, hint)| Some((path, hint?)))
+            .collect()
+    }
+
+    /// A pane's title, and the hint that tells it apart from another open
+    /// document with the same name.
+    fn pane_label(
+        pane: &Entity<DocPane>,
+        hints: &HashMap<PathBuf, String>,
+        cx: &App,
+    ) -> (String, Option<String>) {
+        let pane = pane.read(cx);
+        let hint = (!pane.help)
+            .then(|| hints.get(pane.path.as_ref()?).cloned())
+            .flatten();
+        (pane.title(), hint)
+    }
+
+    /// One pane's title and hint, laid out in a tab or header.
+    fn label_parts(
+        title: String,
+        hint: Option<String>,
+        max: f32,
+        italic: bool,
+        muted: Hsla,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .child(
+                div()
+                    .max_w(px(max))
+                    .truncate()
+                    .when(italic, |d| d.italic())
+                    .child(title),
+            )
+            .when_some(hint, |d, hint| {
+                d.child(
+                    div()
+                        .max_w(px(140.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(hint),
+                )
+            })
     }
 
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (accent, muted) = (theme.accent, theme.muted);
+        let (accent, hover) = (theme.sidebar_accent, theme.sidebar_accent);
         let tabs = &self.tabs;
+        let hints = self.hints(cx);
         let last = tabs.len() - 1;
         let weak = cx.entity().downgrade();
         // Once tabs come from more than one folder, each names its folder.
@@ -2058,23 +2453,67 @@ impl Reader {
             })
             .collect();
         let mixed = folders.iter().flatten().collect::<HashSet<_>>().len() > 1;
+        let count = tabs.len();
+        let tab_line = chrome::accents(cx).tab_line;
         let mut strip = div().id("tab-strip").flex().min_w_0().overflow_x_scroll();
         for (ix, tab) in tabs.tabs.iter().enumerate() {
             let selected = ix == tabs.active;
-            let (pinned, split) = (tab.pinned, tab.is_split());
-            let label: SharedString = Self::tab_label(tab, cx).into();
-            let folder = mixed.then(|| {
+            let (pinned, split, preview) = (tab.pinned, tab.is_split(), tab.preview);
+            let parts: Vec<(String, Option<String>)> = tab
+                .panes()
+                .map(|p| Self::pane_label(p, &hints, cx))
+                .collect();
+            let ghost: SharedString = parts
+                .iter()
+                .map(|(t, _)| t.as_str())
+                .collect::<Vec<_>>()
+                .join("  |  ")
+                .into();
+            // Once tabs come from more than one folder, each names its folder
+            // unless a hint already tells it apart.
+            let folder = (mixed && parts.iter().all(|(_, h)| h.is_none())).then(|| {
                 folders[ix]
                     .iter()
                     .map(|&w| self.workspaces[w].name())
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-            let ghost = label.clone();
+            let paths: Vec<PathBuf> = tab
+                .panes()
+                .filter_map(|p| p.read(cx).path.clone())
+                .collect();
+            let tooltip: Option<SharedString> = (!paths.is_empty()).then(|| {
+                let mut text = paths
+                    .iter()
+                    .map(|p| names::tilde(p))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if preview {
+                    text.push_str("\nPreview · double-click to keep open");
+                }
+                text.into()
+            });
+            let first_path = paths.first().cloned();
             let weak = weak.clone();
+            let max = if split {
+                170.
+            } else if pinned {
+                120.
+            } else {
+                200.
+            };
+            let muted_fg = theme.muted_foreground;
+            let mut label = div().flex().items_center().gap_1p5().min_w_0();
+            for (i, (title, hint)) in parts.into_iter().enumerate() {
+                if i > 0 {
+                    label = label.child(div().text_color(muted_fg).child("|"));
+                }
+                label = label.child(Self::label_parts(title, hint, max, preview, muted_fg));
+            }
             strip = strip.child(
                 div()
                     .id(("tab", ix))
+                    .relative()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -2085,13 +2524,24 @@ impl Reader {
                     .text_sm()
                     .cursor_pointer()
                     .border_r_1()
-                    .border_color(theme.border)
+                    .border_color(theme.sidebar_border)
                     .when(selected, |d| {
                         d.bg(theme.background).text_color(theme.foreground)
                     })
                     .when(!selected, |d| {
                         d.text_color(theme.muted_foreground)
-                            .hover(move |d| d.bg(muted))
+                            .hover(move |d| d.bg(hover))
+                    })
+                    .when_some(tab_line.filter(|_| selected), |d, line| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.))
+                                .bg(line),
+                        )
                     })
                     .when(pinned, |d| {
                         d.child(Icon::new(IconName::Star).small().text_color(theme.primary))
@@ -2103,18 +2553,7 @@ impl Reader {
                                 .text_color(theme.muted_foreground),
                         )
                     })
-                    .child(
-                        div()
-                            .max_w(px(if split {
-                                340.
-                            } else if pinned {
-                                120.
-                            } else {
-                                200.
-                            }))
-                            .truncate()
-                            .child(label),
-                    )
+                    .child(label)
                     .when_some(folder.filter(|f| !f.is_empty()), |d, folder| {
                         d.child(
                             div()
@@ -2138,9 +2577,24 @@ impl Reader {
                                 })),
                         )
                     })
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.activate_tab(ix, window, cx)),
+                    .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                        this.activate_tab(ix, window, cx);
+                        if e.click_count() > 1 {
+                            this.keep_tab(ix, cx);
+                        }
+                    }))
+                    // Middle-click closes, as in browsers and editors.
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, window, cx| {
+                            if !pinned {
+                                this.close_tab(ix, window, cx);
+                            }
+                        }),
                     )
+                    .when_some(tooltip, |d, text| {
+                        d.tooltip(move |w, cx| Tooltip::new(text.clone()).build(w, cx))
+                    })
                     .on_drag(DraggedTab { from: ix }, move |_, _, _, cx| {
                         cx.new(|_| Ghost(ghost.clone()))
                     })
@@ -2167,30 +2621,49 @@ impl Reader {
                                 let _ = weak.update(cx, |v, cx| f(v, ix, window, cx));
                             })
                         };
-                        menu.item(item(
-                            if pinned { "Unpin Tab" } else { "Pin Tab" },
-                            |v, ix, w, cx| {
-                                v.tabs.toggle_pin(ix);
+                        let menu = if preview {
+                            menu.item(item("Keep Open", |v, ix, _, cx| v.keep_tab(ix, cx)))
+                        } else {
+                            menu
+                        };
+                        let menu = menu
+                            .item(item(
+                                if pinned { "Unpin Tab" } else { "Pin Tab" },
+                                |v, ix, w, cx| {
+                                    v.tabs.toggle_pin(ix);
+                                    v.after_tab_change(w, cx);
+                                },
+                            ))
+                            .item(item(
+                                if split {
+                                    "Separate Panes into Tabs"
+                                } else {
+                                    "Split Side by Side"
+                                },
+                                |v, ix, w, cx| {
+                                    v.tabs.activate(ix);
+                                    v.toggle_split(w, cx);
+                                },
+                            ))
+                            .separator()
+                            .item(item("Close Tab", |v, ix, w, cx| v.close_tab(ix, w, cx)))
+                            .item(item("Close Other Tabs", |v, ix, w, cx| {
+                                v.tabs.close_others(ix);
                                 v.after_tab_change(w, cx);
-                            },
-                        ))
-                        .item(item(
-                            if split {
-                                "Separate Panes into Tabs"
-                            } else {
-                                "Split Side by Side"
-                            },
-                            |v, ix, w, cx| {
-                                v.tabs.activate(ix);
-                                v.toggle_split(w, cx);
-                            },
-                        ))
-                        .separator()
-                        .item(item("Close Tab", |v, ix, w, cx| v.close_tab(ix, w, cx)))
-                        .item(item("Close Other Tabs", |v, ix, w, cx| {
-                            v.tabs.close_others(ix);
-                            v.after_tab_change(w, cx);
-                        }))
+                            }))
+                            .item(
+                                item("Close Tabs to the Right", |v, ix, w, cx| {
+                                    v.tabs.close_to_right(ix);
+                                    v.after_tab_change(w, cx);
+                                })
+                                .disabled(ix + 1 >= count),
+                            );
+                        match first_path.clone() {
+                            Some(path) => {
+                                Self::file_menu_items(menu.separator(), path, false, weak.clone())
+                            }
+                            None => menu,
+                        }
                     }),
             );
         }
@@ -2200,8 +2673,8 @@ impl Reader {
             .items_center()
             .h(px(32.))
             .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.sidebar)
+            .border_color(theme.sidebar_border)
+            .bg(theme.tab_bar)
             .child(strip)
             // Dropping on the empty space moves the tab to the end.
             .child(
@@ -2228,6 +2701,7 @@ impl Reader {
                         this.after_tab_change(window, cx);
                     })),
             )
+            .child(div().w_2().flex_shrink_0())
             .child(
                 Button::new("tab-bar-new")
                     .icon(IconName::Plus)
@@ -2253,12 +2727,12 @@ impl Reader {
         let theme = cx.theme();
         let tab = self.tab();
         let focused = tab.focus_right == right;
-        let title: SharedString = tab
+        let hints = self.hints(cx);
+        let (title, hint) = tab
             .pane(right)
-            .map(|p| p.read(cx).title())
-            .unwrap_or_default()
-            .into();
-        let ghost = title.clone();
+            .map(|p| Self::pane_label(p, &hints, cx))
+            .unwrap_or_default();
+        let ghost: SharedString = title.clone().into();
         div()
             .id(Self::pane_id("pane-header", right))
             .relative()
@@ -2270,7 +2744,7 @@ impl Reader {
             .pl_4()
             .pr_1()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(theme.sidebar_border)
             .bg(if focused {
                 theme.background
             } else {
@@ -2291,11 +2765,16 @@ impl Reader {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .when(!focused, |d| d.text_color(theme.muted_foreground))
-                    .child(title),
+                    .child(Self::label_parts(
+                        title,
+                        hint,
+                        400.,
+                        false,
+                        theme.muted_foreground,
+                    )),
             )
             .child(
                 Button::new(Self::pane_id("swap-panes", right))
@@ -2350,7 +2829,7 @@ impl Reader {
                 0.
             };
         let theme = cx.theme();
-        let (border, primary) = (theme.border, theme.primary);
+        let (border, primary) = (theme.sidebar_border, theme.primary);
         let tab = self.tab();
         let split = tab.is_split();
         let body = if !split {
@@ -2365,10 +2844,14 @@ impl Reader {
                 .p_1()
                 .border_b_1()
                 .border_color(border);
+            let hints = self.hints(cx);
             for right in [false, true] {
                 let title = tab
                     .pane(right)
-                    .map(|p| p.read(cx).title())
+                    .map(|p| match Self::pane_label(p, &hints, cx) {
+                        (title, Some(hint)) => format!("{title} · {hint}"),
+                        (title, None) => title,
+                    })
                     .unwrap_or_default();
                 switcher = switcher.child(
                     Button::new(Self::pane_id("pane-switch", right))
@@ -2504,9 +2987,18 @@ impl Reader {
             })
     }
 
+    /// Status bar colors: a fun theme's own, else the chrome's.
+    fn status_colors(cx: &App) -> (Hsla, Hsla) {
+        let theme = cx.theme();
+        chrome::accents(cx)
+            .status
+            .unwrap_or((theme.status_bar, theme.muted_foreground))
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.focused_pane();
         let pane = pane.read(cx);
+        let (status_bg, status_fg) = Self::status_colors(cx);
         div()
             .px_5()
             .h(px(28.))
@@ -2515,22 +3007,100 @@ impl Reader {
             .items_center()
             .justify_between()
             .border_t_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().sidebar_border)
+            .bg(status_bg)
             .text_xs()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(status_fg)
             .child(if pane.source {
                 "SOURCE · READ ONLY"
             } else {
                 "MARKDOWN · READ ONLY"
             })
-            .child(format!(
-                "{}   ·   {} pt",
-                pane.document
-                    .as_ref()
-                    .map(|d| format!("{} words", d.body.split_whitespace().count()))
-                    .unwrap_or("Local files".into()),
-                self.prefs.font_size
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(match pane.stats.clone().filter(|_| !pane.help) {
+                        Some(stats) => self.info_button(stats, cx).into_any_element(),
+                        None => div().child("Local files").into_any_element(),
+                    })
+                    .child(format!("·   {} pt", self.prefs.font_size)),
+            )
+    }
+
+    /// The footer's word count, which opens what the document is made of.
+    fn set_info_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.info_open = open;
+        self.nib = open.then(|| {
+            let mood = self
+                .focused_pane()
+                .read(cx)
+                .stats
+                .as_ref()
+                .map(info::mood)
+                .unwrap_or_default();
+            cx.new(|cx| Nib::new(mood, cx))
+        });
+        cx.notify();
+    }
+
+    fn info_button(&self, stats: markdown_core::Stats, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.entity().downgrade();
+        let (_, fg) = Self::status_colors(cx);
+        let label = format!(
+            "{} words · {} min",
+            info::thousands(stats.words),
+            stats.reading_minutes()
+        );
+        Popover::new("doc-info")
+            .anchor(Anchor::BottomRight)
+            .open(self.info_open)
+            .on_open_change({
+                let weak = weak.clone();
+                move |open, _, cx| {
+                    let _ = weak.update(cx, |v, cx| v.set_info_open(*open, cx));
+                }
+            })
+            .trigger(
+                // Drawn in the status bar's own colors: a fun theme's bar
+                // can be dark under a light chrome.
+                Button::new("doc-info-button")
+                    .custom(
+                        ButtonCustomVariant::new(cx)
+                            .foreground(fg)
+                            .hover(fg.opacity(0.12))
+                            .active(fg.opacity(0.18)),
+                    )
+                    .xsmall()
+                    .label(label)
+                    .tooltip("What's in this document"),
+            )
+            .content(move |_, _, cx| {
+                let Some(view) = weak.upgrade() else {
+                    return div().into_any_element();
+                };
+                let pane = view.read(cx).focused_pane();
+                let pane = pane.read(cx);
+                let (Some(stats), Some(doc)) = (pane.stats.as_ref(), pane.document.as_ref()) else {
+                    return div().into_any_element();
+                };
+                let nib = view
+                    .read(cx)
+                    .nib
+                    .clone()
+                    .map(|n| n.into_any_element())
+                    .unwrap_or_else(|| div().into_any_element());
+                let weak = weak.clone();
+                let jump = Rc::new(move |index: usize, window: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |v, cx| {
+                        v.set_info_open(false, cx);
+                        v.with_pane(cx, |p, cx| p.jump_heading(index, cx));
+                        v.focus_reader(window, cx);
+                    });
+                });
+                info::panel(stats, &doc.headings, jump, nib, cx)
+            })
     }
 
     fn picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2542,13 +3112,18 @@ impl Reader {
                 .document
                 .as_ref()
                 .map(|d| {
+                    // Indent from the shallowest level used, not from `#`.
+                    let top = d.headings.iter().map(|h| h.level).min().unwrap_or(1);
                     d.headings
                         .iter()
                         .enumerate()
                         .map(|(index, h)| {
+                            let heading = h.clone();
                             CommandItem::new()
                                 .label(h.text.clone())
+                                .keywords([format!("h{}", h.level)])
                                 .action(Box::new(JumpHeading { index }))
+                                .child(move |_, cx| info::heading_row(&heading, top, cx))
                         })
                         .collect()
                 })
@@ -2583,7 +3158,9 @@ impl Reader {
             .inset_0()
             .flex()
             .justify_center()
-            .pt(px(80.))
+            // Top-aligned, so the panel is only as tall as its rows.
+            .items_start()
+            .pt(px(64.))
             .bg(rgba(0x00000035))
             .on_mouse_down(MouseButton::Left, move |_, w, cx| {
                 let _ = dismiss.update(cx, |v, cx| v.close_overlay(w, cx));
@@ -2593,9 +3170,8 @@ impl Reader {
                     .w(px(570.))
                     .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .rounded_xl()
-                    .overflow_hidden()
-                    .shadow_md()
+                    .rounded_lg()
+                    .shadow_lg()
                     .child(
                         Command::new(&self.palette)
                             .placeholder(if outline {
@@ -2603,7 +3179,8 @@ impl Reader {
                             } else {
                                 "Find a Markdown file…"
                             })
-                            .max_h(px(320.))
+                            .bordered(true)
+                            .max_h(px(380.))
                             .empty(move |_, _, cx| {
                                 div()
                                     .py_6()
@@ -2624,16 +3201,23 @@ impl Reader {
                                 let _ = cancel.update(cx, |v, cx| v.close_overlay(w, cx));
                             })
                             .footer(move |_, _, cx| {
-                                div()
-                                    .px_3()
-                                    .py_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if outline {
-                                        "↑ ↓ Navigate    ↵ Jump    Esc Close"
-                                    } else {
-                                        "↑ ↓ Navigate    ↵ Open    ⌘↵ New tab    ⌥↵ Split    Esc Close"
-                                    })
+                                if outline {
+                                    info::key_hints(
+                                        &[("↑ ↓", "Navigate"), ("↵", "Jump"), ("Esc", "Close")],
+                                        cx,
+                                    )
+                                } else {
+                                    info::key_hints(
+                                        &[
+                                            ("↑ ↓", "Navigate"),
+                                            ("↵", "Open"),
+                                            ("⌘ ↵", "New tab"),
+                                            ("⌥ ↵", "Split"),
+                                            ("Esc", "Close"),
+                                        ],
+                                        cx,
+                                    )
+                                }
                             }),
                     ),
             )
@@ -2662,8 +3246,21 @@ impl Reader {
         for action in actions.split(',') {
             let (name, arg) = action.split_once(':').unwrap_or((action, ""));
             match name {
-                "dark" => Theme::change(ThemeMode::Dark, Some(window), cx),
-                "light" => Theme::change(ThemeMode::Light, Some(window), cx),
+                "dark" => self.set_appearance(Some(true), window, cx),
+                "light" => self.set_appearance(Some(false), window, cx),
+                "palette" => {
+                    if let Some(p) = Palette::ALL
+                        .into_iter()
+                        .find(|p| p.label().eq_ignore_ascii_case(arg))
+                    {
+                        self.set_palette(p, window, cx);
+                    }
+                }
+                "preview" => {
+                    if let Some(path) = resolve(&self.ws().root.clone().or(base.clone()), arg) {
+                        self.open_in(path, Target::Preview, window, cx);
+                    }
+                }
                 "nosidebar" => self.prefs.sidebar = false,
                 "browse" => {
                     if let Some(parent) = base.clone() {
@@ -2695,6 +3292,13 @@ impl Reader {
                 "source" => self.with_pane(cx, |p, cx| p.toggle_source(cx)),
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(false, window, cx),
+                "appearance" => self.appearance_open = true,
+                "info" => self.set_info_open(true, cx),
+                "nib" => {
+                    if let Some(nib) = &self.nib {
+                        nib.update(cx, |n, _| n.pose(arg));
+                    }
+                }
                 "outline" => self.open_picker(true, window, cx),
                 "find" => {
                     let pane = self.focused_pane();
@@ -2709,7 +3313,9 @@ impl Reader {
 
 impl Render for Reader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_tabs = self.tabs.len() > 1;
+        // A lone preview tab shows too, so its italic title says the next
+        // click replaces it.
+        let show_tabs = self.tabs.len() > 1 || self.tab().preview;
         div()
             .id("viewer")
             .key_context("Viewer")
@@ -2735,7 +3341,7 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &Outline, w, cx| v.open_picker(true, w, cx)))
             .on_action(cx.listener(|v, a: &OpenPath, w, cx| {
                 v.picker = None;
-                v.open_in(a.path.clone(), Target::Focused, w, cx);
+                v.open_in(a.path.clone(), Target::Keep, w, cx);
             }))
             .on_action(
                 cx.listener(|v, _: &OpenInNewTab, w, cx| v.open_selection(Target::NewTab, w, cx)),
@@ -2767,18 +3373,7 @@ impl Render for Reader {
             }))
             .on_action(cx.listener(|v, _: &ToggleTheme, w, cx| {
                 let dark = !cx.theme().mode.is_dark();
-                v.prefs.dark = Some(dark);
-                Theme::change(
-                    if dark {
-                        ThemeMode::Dark
-                    } else {
-                        ThemeMode::Light
-                    },
-                    Some(w),
-                    cx,
-                );
-                v.prefs.save();
-                cx.notify();
+                v.set_appearance(Some(dark), w, cx);
             }))
             .on_action(cx.listener(|v, _: &Larger, _, cx| v.zoom(1., cx)))
             .on_action(cx.listener(|v, _: &Smaller, _, cx| v.zoom(-1., cx)))
@@ -2822,7 +3417,7 @@ impl Render for Reader {
             )
             .on_action(cx.listener(|v, _: &TreeUp, w, cx| v.tree_move(-1, w, cx)))
             .on_action(cx.listener(|v, _: &TreeDown, w, cx| v.tree_move(1, w, cx)))
-            .on_action(cx.listener(|v, _: &TreeOpen, w, cx| v.tree_open(Target::Focused, w, cx)))
+            .on_action(cx.listener(|v, _: &TreeOpen, w, cx| v.tree_open(Target::Keep, w, cx)))
             .on_action(cx.listener(|v, _: &TreeLeft, _, cx| v.tree_left(cx)))
             .on_action(cx.listener(|v, _: &TreeRight, w, cx| v.tree_right(w, cx)))
             .child(self.toolbar(window, cx))
@@ -3399,12 +3994,160 @@ mod tests {
         assert_eq!(names, ["Open Files", "A.md", "B.md"]);
         // Clicking an open document goes to its tab.
         with_reader(w, &view, cx, |v, w, cx| {
-            v.open_from_tree(v.active, tmp.path().join("A.md"), Target::Focused, w, cx)
+            v.open_from_tree(v.active, tmp.path().join("A.md"), Target::Preview, w, cx)
         });
         assert_eq!(
             view.read_with(cx, |v, _| (v.tabs.len(), v.tabs.active)),
             (2, 0)
         );
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_clicks_preview_and_double_clicks_keep(cx: &mut TestAppContext) {
+        let tmp = folder(&[("A.md", "# A"), ("B.md", "# B"), ("C.md", "# C")]);
+        let p = |n: &str| tmp.path().join(n);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(tmp.path().into(), w, cx)
+        });
+        let state = |view: &Entity<Reader>, cx: &mut TestAppContext| {
+            view.read_with(cx, |v, cx| {
+                (
+                    v.tabs.len(),
+                    v.tabs.preview_index(),
+                    v.focused_pane().read(cx).title(),
+                )
+            })
+        };
+        let ws = view.read_with(cx, |v, _| v.active);
+
+        // The empty tab becomes the preview, and the next click reuses it.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(ws, p("A.md"), Target::Preview, w, cx)
+        });
+        assert_eq!(state(&view, cx), (1, Some(0), "A.md".into()));
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(ws, p("B.md"), Target::Preview, w, cx)
+        });
+        assert_eq!(state(&view, cx), (1, Some(0), "B.md".into()));
+        assert!(pane(&view, cx, |p| p.can_go_back()), "Back returns to A");
+
+        // A double-click keeps it; the next click opens a new preview tab.
+        with_reader(w, &view, cx, |v, _, cx| v.keep_path(&p("B.md"), cx));
+        assert_eq!(state(&view, cx), (1, None, "B.md".into()));
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(ws, p("C.md"), Target::Preview, w, cx)
+        });
+        assert_eq!(state(&view, cx), (2, Some(1), "C.md".into()));
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(ws, p("A.md"), Target::Preview, w, cx)
+        });
+        assert_eq!(state(&view, cx), (2, Some(1), "A.md".into()));
+        assert!(view.read_with(cx, |v, _| v.prefs.tabs[1].preview), "saved");
+
+        // A file already open comes forward instead.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_in(p("B.md"), Target::Preview, w, cx)
+        });
+        assert_eq!(state(&view, cx), (2, Some(1), "B.md".into()));
+
+        // ↵ / Quick Open / Finder open into the preview tab and keep it.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_in(p("C.md"), Target::Keep, w, cx)
+        });
+        assert_eq!(state(&view, cx), (2, None, "C.md".into()));
+
+        // ⌘-click always opens a kept tab.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_from_tree(ws, p("A.md"), Target::NewTab, w, cx)
+        });
+        assert_eq!(state(&view, cx), (3, None, "A.md".into()));
+    }
+
+    #[gpui_kit::test]
+    fn tabs_with_the_same_name_name_their_folders(cx: &mut TestAppContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        for dir in ["notes", "tools"] {
+            std::fs::create_dir(tmp.path().join(dir)).unwrap();
+            std::fs::write(tmp.path().join(dir).join("README.md"), "# Read me").unwrap();
+        }
+        std::fs::write(tmp.path().join("Other.md"), "# Other").unwrap();
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(tmp.path().into(), w, cx);
+            v.open_in(tmp.path().join("notes/README.md"), Target::Keep, w, cx);
+            v.open_in(tmp.path().join("tools/README.md"), Target::NewTab, w, cx);
+            v.open_in(tmp.path().join("Other.md"), Target::NewTab, w, cx);
+        });
+        let hints = view.read_with(cx, |v, cx| {
+            let hints = v.hints(cx);
+            v.tabs
+                .tabs
+                .iter()
+                .map(|t| Reader::pane_label(&t.left, &hints, cx).1)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(hints, [Some("notes".into()), Some("tools".into()), None]);
+    }
+
+    #[gpui_kit::test]
+    fn color_presets_tint_the_chrome_but_not_the_page(cx: &mut TestAppContext) {
+        let (w, view) = open(cx);
+        let colors = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let t = cx.theme();
+                (
+                    t.background,
+                    t.sidebar,
+                    t.title_bar,
+                    t.tab_bar,
+                    t.status_bar,
+                    t.muted,
+                )
+            })
+        };
+        let (page, sidebar, toolbar, tabs, status, code) = colors(cx);
+        assert_eq!((toolbar, status, tabs), (page, page, sidebar), "neutral");
+        for dark in [false, true] {
+            with_reader(w, &view, cx, |v, w, cx| {
+                v.set_appearance(Some(dark), w, cx);
+                v.set_palette(Palette::Synthwave, w, cx);
+            });
+            let tint = Palette::Synthwave.colors(dark).unwrap();
+            let (page2, sidebar2, toolbar2, tabs2, status2, _) = colors(cx);
+            assert_eq!(
+                (sidebar2, toolbar2, tabs2, status2),
+                (tint.chrome, tint.chrome, tint.chrome, tint.chrome)
+            );
+            assert_ne!(page2, tint.chrome);
+            assert_eq!(cx.update(|cx| cx.theme().is_dark()), dark);
+        }
+        // Back to neutral light: exactly as before.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.set_palette(Palette::Classic, w, cx);
+            v.set_appearance(Some(false), w, cx);
+        });
+        assert_eq!(colors(cx), (page, sidebar, toolbar, tabs, status, code));
+    }
+
+    #[gpui_kit::test]
+    fn appearance_panel_stays_open_while_trying_themes(cx: &mut TestAppContext) {
+        let (w, view) = open(cx);
+        interact(w, cx, |w, cx| w.click("theme", cx));
+        interact(w, cx, |_, _| {});
+        interact(w, cx, |_, _| {});
+        interact(w, cx, |w, cx| w.click("palette-Synthwave", cx));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.prefs.palette),
+            Palette::Synthwave
+        );
+        // Still open: the next row is there to click without reopening.
+        interact(w, cx, |w, cx| {
+            w.click("palette-Lagoon", cx);
+            w.click("appearance-Dark", cx);
+        });
+        let prefs = view.read_with(cx, |v, _| (v.prefs.palette, v.prefs.dark));
+        assert_eq!(prefs, (Palette::Lagoon, Some(true)));
     }
 
     #[gpui_kit::test]

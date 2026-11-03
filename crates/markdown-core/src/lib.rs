@@ -12,7 +12,42 @@ pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
 pub struct Heading {
     pub text: String,
     pub id: String,
+    /// 1 for `#`, up to 6.
+    pub level: u8,
     pub range: Range<usize>,
+    /// Prose words from this heading to the next one.
+    pub words: usize,
+}
+
+/// What a document is made of, for the info panel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Stats {
+    /// Prose words: code, URLs and Markdown syntax don't count.
+    pub words: usize,
+    pub characters: usize,
+    pub lines: usize,
+    /// Heading counts by level, `#` first.
+    pub headings: [usize; 6],
+    pub paragraphs: usize,
+    pub list_items: usize,
+    pub tasks: usize,
+    pub tasks_done: usize,
+    pub links: usize,
+    pub images: usize,
+    pub tables: usize,
+    pub quotes: usize,
+    pub footnotes: usize,
+    pub code_blocks: usize,
+    pub code_lines: usize,
+    /// Fenced code languages, most used first.
+    pub languages: Vec<(String, usize)>,
+}
+
+impl Stats {
+    /// Minutes at an unhurried 230 words a minute, at least one.
+    pub fn reading_minutes(&self) -> usize {
+        self.words.div_ceil(230).max(1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -88,18 +123,20 @@ impl Document {
             }
         }
         let mut headings = Vec::new();
-        let mut current: Option<(String, Range<usize>)> = None;
+        let mut current: Option<(String, u8, Range<usize>)> = None;
         let mut counts = std::collections::HashMap::<String, usize>::new();
         for (event, range) in Parser::new_ext(&body, Options::all()).into_offset_iter() {
             match event {
-                Event::Start(Tag::Heading { .. }) => current = Some((String::new(), range)),
+                Event::Start(Tag::Heading { level, .. }) => {
+                    current = Some((String::new(), level as u8, range))
+                }
                 Event::Text(t) | Event::Code(t) => {
-                    if let Some((name, _)) = &mut current {
+                    if let Some((name, _, _)) = &mut current {
                         name.push_str(&t);
                     }
                 }
                 Event::End(TagEnd::Heading(_)) => {
-                    if let Some((text, range)) = current.take() {
+                    if let Some((text, level, range)) = current.take() {
                         let slug = text
                             .to_lowercase()
                             .chars()
@@ -115,11 +152,27 @@ impl Document {
                             format!("{slug}-{count}")
                         };
                         *count += 1;
-                        headings.push(Heading { text, id, range });
+                        headings.push(Heading {
+                            text,
+                            id,
+                            level,
+                            range,
+                            words: 0,
+                        });
                     }
                 }
                 _ => {}
             }
+        }
+        // Each heading owns the prose up to the next one.
+        let ends: Vec<usize> = headings
+            .iter()
+            .skip(1)
+            .map(|h| h.range.start)
+            .chain([body.len()])
+            .collect();
+        for (heading, end) in headings.iter_mut().zip(ends) {
+            heading.words = prose_words(&body[heading.range.end.min(end)..end]);
         }
         Self {
             source,
@@ -128,6 +181,50 @@ impl Document {
             metadata_error,
             headings,
         }
+    }
+
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats {
+            characters: self.body.chars().count(),
+            lines: self.body.lines().count(),
+            ..Stats::default()
+        };
+        let mut languages = std::collections::HashMap::<String, usize>::new();
+        let mut code = false;
+        for event in Parser::new_ext(&self.body, Options::all()) {
+            match event {
+                Event::Start(Tag::Heading { level, .. }) => s.headings[level as usize - 1] += 1,
+                Event::Start(Tag::Paragraph) => s.paragraphs += 1,
+                Event::Start(Tag::Item) => s.list_items += 1,
+                Event::TaskListMarker(done) => {
+                    s.tasks += 1;
+                    s.tasks_done += done as usize;
+                }
+                Event::Start(Tag::Link { .. }) => s.links += 1,
+                Event::Start(Tag::Image { .. }) => s.images += 1,
+                Event::Start(Tag::Table(_)) => s.tables += 1,
+                Event::Start(Tag::BlockQuote(_)) => s.quotes += 1,
+                Event::Start(Tag::FootnoteDefinition(_)) => s.footnotes += 1,
+                Event::Start(Tag::CodeBlock(kind)) => {
+                    code = true;
+                    s.code_blocks += 1;
+                    if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
+                        && let Some(lang) = info.split([' ', ',', '{']).next()
+                        && !lang.is_empty()
+                    {
+                        *languages.entry(lang.to_lowercase()).or_default() += 1;
+                    }
+                }
+                Event::End(TagEnd::CodeBlock) => code = false,
+                Event::Text(t) if code => s.code_lines += t.lines().count(),
+                Event::Text(t) => s.words += t.split_whitespace().count(),
+                _ => {}
+            }
+        }
+        s.languages = languages.into_iter().collect();
+        s.languages
+            .sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        s
     }
 
     pub fn source_markdown(&self) -> String {
@@ -141,6 +238,21 @@ impl Document {
         let fence = "`".repeat(longest.max(2) + 1);
         format!("{fence}markdown\n{}\n{fence}", self.source)
     }
+}
+
+/// Words of running text, skipping code blocks and Markdown syntax.
+fn prose_words(markdown: &str) -> usize {
+    let mut code = false;
+    let mut words = 0;
+    for event in Parser::new_ext(markdown, Options::all()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => code = true,
+            Event::End(TagEnd::CodeBlock) => code = false,
+            Event::Text(t) if !code => words += t.split_whitespace().count(),
+            _ => {}
+        }
+    }
+    words
 }
 
 pub enum Link {
@@ -291,6 +403,30 @@ mod tests {
             d.headings.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
             ["hello", "hello-1"]
         );
+    }
+    #[test]
+    fn headings_know_their_level_and_section_words() {
+        let d = Document::parse(
+            "# One\nfour words of prose\n## Two\n```\nnot counted here\n```\nthree more words\n"
+                .into(),
+        );
+        let h: Vec<_> = d.headings.iter().map(|h| (h.level, h.words)).collect();
+        assert_eq!(h, [(1, 4), (2, 3)]);
+    }
+    #[test]
+    fn stats_break_the_document_down() {
+        let d = Document::parse(
+            "---\ntitle: x\n---\n# Title\n\nSome *real* words, [a link](x.md).\n\n## Tasks\n- [x] done\n- [ ] todo\n- plain\n\n> quoted\n\n```rust\nfn a() {}\nfn b() {}\n```\n\n```Rust\n1\n```\n\n~~~\nx\n~~~\n\n| A |\n|---|\n| 1 |\n\n![pic](p.png)\n".into(),
+        );
+        let s = d.stats();
+        assert_eq!(s.headings, [1, 1, 0, 0, 0, 0]);
+        assert_eq!((s.tasks, s.tasks_done, s.list_items), (2, 1, 3));
+        assert_eq!((s.links, s.images, s.tables, s.quotes), (1, 1, 1, 1));
+        assert_eq!((s.code_blocks, s.code_lines), (3, 4));
+        assert_eq!(s.languages, [("rust".to_string(), 2)]);
+        // Title, Some real words a link, Tasks, done todo plain, quoted, A 1, pic
+        assert_eq!(s.words, 15);
+        assert_eq!(s.reading_minutes(), 1);
     }
     #[test]
     fn unicode_search_returns_original_offsets() {

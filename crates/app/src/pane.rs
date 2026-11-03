@@ -16,12 +16,12 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
-use markdown_core::{Document, Link};
+use markdown_core::{Document, Link, Stats};
 use std::{ops::Range, path::PathBuf};
 
 const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
 pub const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Add a folder as a workspace\n- **⌘P** — Jump to a file (**⌘↵** opens it in a new tab, **⌥↵** beside this one)\n- **⌘T** — New tab · **⌘\\\\** — Split side by side\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
-pub const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / add folder workspace |\n| ⌘P / ⌘K | Quick Open (⌘↵ new tab, ⌥↵ split) |\n| ⌘T / ⌘W / ⇧⌘T | New tab / close pane or tab / reopen closed |\n| ⌃Tab / ⌃⇧Tab, ⇧⌘] / ⇧⌘[ | Next / previous tab |\n| ⌘\\\\ | Split side by side / unsplit |\n| ⌥⌘← / ⌥⌘→ | Focus left / right pane |\n| ⌃1 … ⌃9 | Switch workspace (in sidebar order) |\n| ⌘-click / ⌥-click in tree | Open in new tab / in the other pane |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree; ← / → close / open folders |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| ⇧⌘W | Close window |\n| Escape | Dismiss picker, find, or help |\n\nIn the sidebar, click a workspace to open or close it without switching; drag workspaces to reorder them. Drag a tab onto the left or right half of the page to read it side by side. Drag a pane's header back to the tab bar to give it its own tab.\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels per workspace. A tab shows one document, or two side by side. Mermaid stays visible as code. Remote images are not fetched.\n";
+pub const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / add folder workspace |\n| ⌘P / ⌘K | Quick Open (⌘↵ new tab, ⌥↵ split) |\n| ⌘T / ⌘W / ⇧⌘T | New tab / close pane or tab / reopen closed |\n| ⌃Tab / ⌃⇧Tab, ⇧⌘] / ⇧⌘[ | Next / previous tab |\n| ⌘\\\\ | Split side by side / unsplit |\n| ⌥⌘← / ⌥⌘→ | Focus left / right pane |\n| ⌃1 … ⌃9 | Switch workspace (in sidebar order) |\n| Click / double-click in tree | Preview (italic tab, reused) / keep open |\n| ⌘-click / ⌥-click in tree | Open in new tab / in the other pane |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree; ← / → close / open folders |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark (palette button: system & themes) |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| ⇧⌘W | Close window |\n| Escape | Dismiss picker, find, or help |\n\nA single click in the sidebar previews a file in a reused tab with an italic title; double-click the file or its tab to keep it open. In the sidebar, click a workspace to open or close it without switching; drag workspaces to reorder them. Drag a tab onto the left or right half of the page to read it side by side. Drag a pane's header back to the tab bar to give it its own tab.\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels per workspace. A tab shows one document, or two side by side. Mermaid stays visible as code. Remote images are not fetched.\n";
 
 /// Shared reading size, set by the window from preferences.
 pub struct FontSize(pub f32);
@@ -39,6 +39,8 @@ pub struct DocPane {
     find_input: Entity<InputState>,
     pub path: Option<PathBuf>,
     pub document: Option<Document>,
+    /// What the document is made of; computed with it, off the main thread.
+    pub stats: Option<Stats>,
     pub source: bool,
     pub properties: bool,
     pub help: bool,
@@ -94,6 +96,7 @@ impl DocPane {
             find_input,
             path: None,
             document: None,
+            stats: None,
             source: false,
             properties: false,
             help: false,
@@ -188,9 +191,12 @@ impl DocPane {
             self.history.push(path.clone());
             self.history_index = self.history.len() - 1;
         }
-        let task = cx
-            .background_executor()
-            .spawn(async move { markdown_core::read_document(&path) });
+        let task = cx.background_executor().spawn(async move {
+            markdown_core::read_document(&path).map(|doc| {
+                let stats = doc.stats();
+                (doc, stats)
+            })
+        });
         self._load = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -200,13 +206,15 @@ impl DocPane {
                 this.loading = false;
                 match result {
                     // set_text preserves unchanged block identities and scroll on refresh.
-                    Ok(doc) => {
+                    Ok((doc, stats)) => {
                         this.document = Some(doc);
+                        this.stats = Some(stats);
                         this.present(cx);
                     }
                     Err(e) => {
                         this.error = Some(e);
                         this.document = None;
+                        this.stats = None;
                         this.text.update(cx, |s, cx| s.set_text("# Unable to read this file\n\nCheck that it still exists and is readable, then press **⌘R** to retry.", cx));
                     }
                 }
@@ -577,8 +585,9 @@ impl Render for DocPane {
                 div()
                     .flex_1()
                     .min_h_0()
+                    // Only sideways: the page scrolls right up to the tab
+                    // bar instead of vanishing under an empty band.
                     .px(px(32.))
-                    .py(px(24.))
                     .text_size(px(font_size))
                     .line_height(relative(1.65))
                     .child(if self.loading && self.document.is_none() {

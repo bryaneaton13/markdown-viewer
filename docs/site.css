@@ -69,7 +69,7 @@ h1 em { color: #ee7d3f; }
 [data-preview-theme="dark"] .window-chrome { color: #9da096; background: #1c1e1a; border-color: #2e302a; }
 [data-preview-theme="dark"] .traffic-lights i { background: #53574b; }
 .preview figcaption { min-height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 20px; color: var(--muted); font-size: 12px; text-align: left; }
-.theme-picker { display: flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #eeeff3; }
+.theme-picker { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: #eeeff3; }
 .theme-picker button { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 12px; border: 1px solid transparent; border-radius: 4px; background: transparent; color: #5b6180; font-size: 11px; transition: background .15s; }
 .theme-picker button:hover { background: #ffffff60; }
 .theme-picker button[aria-pressed="true"] { border-color: #dcdee6; background: #fff; color: var(--ink); box-shadow: 0 1px 3px #1d234008; }
