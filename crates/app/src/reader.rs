@@ -1514,7 +1514,7 @@ impl Reader {
                 (prefs.dark, prefs.palette)
             })
             .unwrap_or_default();
-        let mut menu = menu.min_w(px(200.)).label("Appearance");
+        let mut menu = menu.min_w(px(210.)).label("Appearance");
         for (label, value) in [
             ("Light", Some(false)),
             ("Dark", Some(true)),
@@ -1527,24 +1527,40 @@ impl Reader {
                 },
             ));
         }
-        menu = menu.separator().label("Colors");
-        for option in Palette::ALL {
-            let weak = weak.clone();
-            let swatch = option.swatch(cx);
-            menu = menu.item(
-                PopupMenuItem::element(move |_, _| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().size(px(10.)).rounded_full().bg(swatch))
-                        .child(option.label())
-                })
-                .checked(option == palette)
-                .on_click(move |_, window, cx| {
-                    let _ = weak.update(cx, |v, cx| v.set_palette(option, window, cx));
-                }),
-            );
+        for (group, options) in [
+            ("Editor Themes", &Palette::EDITOR[..]),
+            ("Fun Themes", &Palette::FUN[..]),
+        ] {
+            menu = menu.separator().label(group);
+            for &option in options {
+                let weak = weak.clone();
+                let swatches = option.swatches(cx);
+                menu = menu.item(
+                    PopupMenuItem::element(move |_, _| {
+                        // Overlapping dots, one per color the theme adds.
+                        let mut dots = div().flex().items_center().w(px(26.));
+                        for (i, &color) in swatches.iter().enumerate() {
+                            dots = dots.child(
+                                div()
+                                    .size(px(10.))
+                                    .rounded_full()
+                                    .bg(color)
+                                    .when(i > 0, |d| d.ml(px(-3.))),
+                            );
+                        }
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(dots)
+                            .child(option.label())
+                    })
+                    .checked(option == palette)
+                    .on_click(move |_, window, cx| {
+                        let _ = weak.update(cx, |v, cx| v.set_palette(option, window, cx));
+                    }),
+                );
+            }
         }
         menu
     }
@@ -1887,6 +1903,9 @@ impl Reader {
         let theme = cx.theme();
         let (hover, accent, ring) = (theme.sidebar_accent, theme.sidebar_accent, theme.ring);
         let muted = theme.muted_foreground;
+        let accents = chrome::accents(cx);
+        let folder_color = accents.folder.unwrap_or(muted);
+        let file_color = accents.file.unwrap_or(muted);
         let cursor = keyboard == Some(ix);
         let current = self.focused_pane().read(cx).path.clone();
         let row = div()
@@ -1937,6 +1956,8 @@ impl Reader {
                         .flex_shrink_0()
                         .text_color(if active {
                             theme.primary
+                        } else if folder {
+                            folder_color
                         } else {
                             muted
                         }),
@@ -1946,7 +1967,7 @@ impl Reader {
                             .flex_1()
                             .min_w_0()
                             .flex()
-                            .items_baseline()
+                            .items_center()
                             .gap_1p5()
                             .whitespace_nowrap()
                             .child(
@@ -2078,7 +2099,12 @@ impl Reader {
                         d.bg(accent).text_color(theme.sidebar_accent_foreground)
                     })
                     .when(!selected, |d| d.hover(move |s| s.bg(hover)))
-                    .child(Icon::new(icon).size_4().flex_shrink_0().text_color(muted))
+                    .child(
+                        Icon::new(icon)
+                            .size_4()
+                            .flex_shrink_0()
+                            .text_color(if directory { folder_color } else { file_color }),
+                    )
                     .child(
                         div().flex_shrink_0().max_w(px(170.)).truncate().child(
                             entry
@@ -2241,13 +2267,19 @@ impl Reader {
             .child(
                 div()
                     .px_4()
-                    .py_3()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
                     .border_t_1()
                     .border_color(cx.theme().sidebar_border)
+                    // A fun theme's status bar runs under the sidebar too.
+                    .bg(chrome::accents(cx)
+                        .status
+                        .map_or(cx.theme().sidebar, |(bg, _)| bg))
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .truncate()
-                    .child(if ws.indexing {
+                    .text_color(Self::status_colors(cx).1)
+                    .child(div().min_w_0().truncate().child(if ws.indexing {
                         format!("{} · Indexing…", ws.name())
                     } else if ws.root.is_none() {
                         match ws.rows.len() {
@@ -2262,7 +2294,7 @@ impl Reader {
                             ws.files.len(),
                             if ws.limited { " · limit reached" } else { "" }
                         )
-                    }),
+                    })),
             )
     }
 
@@ -2307,7 +2339,7 @@ impl Reader {
     ) -> impl IntoElement {
         div()
             .flex()
-            .items_baseline()
+            .items_center()
             .gap_1p5()
             .min_w_0()
             .child(
@@ -2352,6 +2384,7 @@ impl Reader {
             .collect();
         let mixed = folders.iter().flatten().collect::<HashSet<_>>().len() > 1;
         let count = tabs.len();
+        let tab_line = chrome::accents(cx).tab_line;
         let mut strip = div().id("tab-strip").flex().min_w_0().overflow_x_scroll();
         for (ix, tab) in tabs.tabs.iter().enumerate() {
             let selected = ix == tabs.active;
@@ -2410,6 +2443,7 @@ impl Reader {
             strip = strip.child(
                 div()
                     .id(("tab", ix))
+                    .relative()
                     .flex()
                     .items_center()
                     .flex_shrink_0()
@@ -2427,6 +2461,17 @@ impl Reader {
                     .when(!selected, |d| {
                         d.text_color(theme.muted_foreground)
                             .hover(move |d| d.bg(hover))
+                    })
+                    .when_some(tab_line.filter(|_| selected), |d, line| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.))
+                                .bg(line),
+                        )
                     })
                     .when(pinned, |d| {
                         d.child(Icon::new(IconName::Star).small().text_color(theme.primary))
@@ -2586,6 +2631,7 @@ impl Reader {
                         this.after_tab_change(window, cx);
                     })),
             )
+            .child(div().w_2().flex_shrink_0())
             .child(
                 Button::new("tab-bar-new")
                     .icon(IconName::Plus)
@@ -2871,9 +2917,18 @@ impl Reader {
             })
     }
 
+    /// Status bar colors: a fun theme's own, else the chrome's.
+    fn status_colors(cx: &App) -> (Hsla, Hsla) {
+        let theme = cx.theme();
+        chrome::accents(cx)
+            .status
+            .unwrap_or((theme.status_bar, theme.muted_foreground))
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.focused_pane();
         let pane = pane.read(cx);
+        let (status_bg, status_fg) = Self::status_colors(cx);
         div()
             .px_5()
             .h(px(28.))
@@ -2883,9 +2938,9 @@ impl Reader {
             .justify_between()
             .border_t_1()
             .border_color(cx.theme().sidebar_border)
-            .bg(cx.theme().status_bar)
+            .bg(status_bg)
             .text_xs()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(status_fg)
             .child(if pane.source {
                 "SOURCE · READ ONLY"
             } else {
@@ -3888,9 +3943,9 @@ mod tests {
         for dark in [false, true] {
             with_reader(w, &view, cx, |v, w, cx| {
                 v.set_appearance(Some(dark), w, cx);
-                v.set_palette(Palette::Sage, w, cx);
+                v.set_palette(Palette::Synthwave, w, cx);
             });
-            let tint = Palette::Sage.colors(dark).unwrap();
+            let tint = Palette::Synthwave.colors(dark).unwrap();
             let (page2, sidebar2, toolbar2, tabs2, status2, _) = colors(cx);
             assert_eq!(
                 (sidebar2, toolbar2, tabs2, status2),
@@ -3901,7 +3956,7 @@ mod tests {
         }
         // Back to neutral light: exactly as before.
         with_reader(w, &view, cx, |v, w, cx| {
-            v.set_palette(Palette::Neutral, w, cx);
+            v.set_palette(Palette::Classic, w, cx);
             v.set_appearance(Some(false), w, cx);
         });
         assert_eq!(colors(cx), (page, sidebar, toolbar, tabs, status, code));

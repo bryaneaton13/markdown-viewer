@@ -9,7 +9,9 @@ pub struct Preferences {
     pub font_size: f32,
     /// Light or dark; `None` matches the system.
     pub dark: Option<bool>,
-    /// Color preset for the window chrome.
+    /// Color theme for the window chrome. A name this version doesn't know
+    /// falls back to Classic instead of discarding every setting.
+    #[serde(deserialize_with = "lenient")]
     pub palette: Palette,
     /// Open workspaces, in sidebar order.
     pub workspaces: Vec<SavedWorkspace>,
@@ -70,6 +72,11 @@ pub struct SavedPane {
     pub source: bool,
 }
 
+fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Palette, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -84,7 +91,7 @@ impl Default for Preferences {
             sidebar: true,
             font_size: 16.,
             dark: None,
-            palette: Palette::Neutral,
+            palette: Palette::Classic,
             workspaces: Vec::new(),
             active_workspace: 0,
             tabs: Vec::new(),
@@ -207,6 +214,13 @@ mod tests {
     }
 
     #[test]
+    fn unknown_theme_names_keep_the_other_settings() {
+        let prefs: Preferences =
+            serde_json::from_str(r#"{"font_size":20,"palette":"sage"}"#).unwrap();
+        assert_eq!((prefs.font_size, prefs.palette), (20., Palette::Classic));
+    }
+
+    #[test]
     fn workspaces_round_trip() {
         let mut prefs = Preferences::default();
         prefs.workspaces.push(SavedWorkspace {
@@ -238,7 +252,7 @@ mod tests {
         prefs.active_tab = 1;
         prefs.active_workspace = 3;
         prefs.sidebar_sort = Sort::Recent;
-        prefs.palette = Palette::Sage;
+        prefs.palette = Palette::Synthwave;
         let back: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         let back = back.normalized();
@@ -246,10 +260,10 @@ mod tests {
         assert_eq!((&back.tabs, back.active_tab), (&prefs.tabs, 1));
         assert_eq!(back.active_workspace, 0, "clamped");
         assert_eq!(back.sidebar_sort, Sort::Recent);
-        assert_eq!(back.palette, Palette::Sage);
+        assert_eq!(back.palette, Palette::Synthwave);
         let json = serde_json::to_string(&back).unwrap();
         assert!(json.contains(r#""sidebar_sort":"recent""#));
-        assert!(json.contains(r#""palette":"sage""#));
+        assert!(json.contains(r#""palette":"synthwave""#));
     }
 
     #[test]
