@@ -1,4 +1,4 @@
-use crate::sidebar::Sort;
+use crate::{chrome::Palette, sidebar::Sort};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -7,7 +7,10 @@ use std::path::PathBuf;
 pub struct Preferences {
     pub sidebar: bool,
     pub font_size: f32,
+    /// Light or dark; `None` matches the system.
     pub dark: Option<bool>,
+    /// Color preset for the window chrome.
+    pub palette: Palette,
     /// Open workspaces, in sidebar order.
     pub workspaces: Vec<SavedWorkspace>,
     pub active_workspace: usize,
@@ -54,6 +57,9 @@ pub struct SavedTab {
     pub focus_right: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Still the preview tab, which the next sidebar click reuses.
+    #[serde(skip_serializing_if = "is_false")]
+    pub preview: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
@@ -78,6 +84,7 @@ impl Default for Preferences {
             sidebar: true,
             font_size: 16.,
             dark: None,
+            palette: Palette::Neutral,
             workspaces: Vec::new(),
             active_workspace: 0,
             tabs: Vec::new(),
@@ -221,12 +228,17 @@ mod tests {
                 }),
                 focus_right: true,
                 pinned: true,
+                preview: false,
             },
-            SavedTab::default(),
+            SavedTab {
+                preview: true,
+                ..Default::default()
+            },
         ];
         prefs.active_tab = 1;
         prefs.active_workspace = 3;
         prefs.sidebar_sort = Sort::Recent;
+        prefs.palette = Palette::Sage;
         let back: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         let back = back.normalized();
@@ -234,8 +246,10 @@ mod tests {
         assert_eq!((&back.tabs, back.active_tab), (&prefs.tabs, 1));
         assert_eq!(back.active_workspace, 0, "clamped");
         assert_eq!(back.sidebar_sort, Sort::Recent);
+        assert_eq!(back.palette, Palette::Sage);
         let json = serde_json::to_string(&back).unwrap();
         assert!(json.contains(r#""sidebar_sort":"recent""#));
+        assert!(json.contains(r#""palette":"sage""#));
     }
 
     #[test]

@@ -27,6 +27,10 @@ pub struct Tab<P> {
     pub focus_right: bool,
     /// Pinned tabs sit first and have no close button.
     pub pinned: bool,
+    /// A preview tab (italic title) shows whatever was last single-clicked
+    /// in the sidebar and is reused by the next click. Double-clicking,
+    /// pinning, splitting or moving it keeps it open.
+    pub preview: bool,
 }
 
 impl<P> Tab<P> {
@@ -37,6 +41,15 @@ impl<P> Tab<P> {
             right: None,
             focus_right: false,
             pinned: false,
+            preview: false,
+        }
+    }
+
+    /// A tab that the next sidebar click may replace.
+    pub fn preview(pane: P) -> Self {
+        Self {
+            preview: true,
+            ..Self::new(pane)
         }
     }
 
@@ -71,6 +84,7 @@ impl<P> Tab<P> {
         if self.is_split() {
             return false;
         }
+        self.preview = false;
         if right {
             self.right = Some(pane);
         } else {
@@ -206,8 +220,48 @@ impl<P> TabSet<P> {
         self.active = self.tabs.iter().position(|t| t.id == keep).unwrap_or(0);
     }
 
+    /// Close the unpinned tabs after `index`.
+    pub fn close_to_right(&mut self, index: usize) {
+        let Some(keep) = self.tabs.get(index).map(|t| t.id) else {
+            return;
+        };
+        let active = self.tabs[self.active].id;
+        let mut kept = Vec::new();
+        for (i, tab) in std::mem::take(&mut self.tabs).into_iter().enumerate() {
+            if i <= index || tab.pinned {
+                kept.push(tab);
+            } else {
+                self.remember(tab);
+            }
+        }
+        self.tabs = kept;
+        self.active = self
+            .tabs
+            .iter()
+            .position(|t| t.id == active)
+            .or_else(|| self.tabs.iter().position(|t| t.id == keep))
+            .unwrap_or(0);
+    }
+
+    /// The preview tab, if there is one.
+    pub fn preview_index(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| t.preview)
+    }
+
+    /// Keep a preview tab open: the next sidebar click opens a new one.
+    pub fn keep(&mut self, index: usize) -> bool {
+        match self.tabs.get_mut(index) {
+            Some(tab) if tab.preview => {
+                tab.preview = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn remember(&mut self, mut tab: Tab<P>) {
         tab.pinned = false;
+        tab.preview = false;
         self.closed.push(tab);
         if self.closed.len() > CLOSED_KEPT {
             self.closed.remove(0);
@@ -268,7 +322,8 @@ impl<P> TabSet<P> {
             return;
         }
         let id = self.tabs[self.active].id;
-        let tab = self.tabs.remove(from);
+        let mut tab = self.tabs.remove(from);
+        tab.preview = false;
         self.tabs.insert(to.min(self.tabs.len()), tab);
         self.active = self.tabs.iter().position(|t| t.id == id).unwrap_or(0);
         self.keep_pinned_first();
@@ -277,6 +332,7 @@ impl<P> TabSet<P> {
     pub fn toggle_pin(&mut self, index: usize) {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.pinned = !tab.pinned;
+            tab.preview = false;
             self.keep_pinned_first();
         }
     }
@@ -441,5 +497,50 @@ mod tests {
             ["c", "b", "d", "a"],
             "unpinned can't pass pinned"
         );
+    }
+
+    #[test]
+    fn preview_tabs_are_kept_by_pinning_splitting_or_moving() {
+        let mut set = TabSet::new(Tab::new("a"));
+        set.insert_after_active(Tab::preview("b"));
+        assert_eq!(set.preview_index(), Some(1));
+        assert!(set.keep(1));
+        assert!(!set.keep(1), "already kept");
+        assert_eq!(set.preview_index(), None);
+
+        set.insert_after_active(Tab::preview("c"));
+        set.toggle_pin(2);
+        assert_eq!(set.preview_index(), None, "pinning keeps it");
+
+        set.insert_after_active(Tab::preview("d"));
+        set.active_mut().split_with("e", true);
+        assert_eq!(set.preview_index(), None, "splitting keeps it");
+
+        set.insert_after_active(Tab::preview("f"));
+        let at = set.preview_index().unwrap();
+        set.move_tab(at, 1);
+        assert_eq!(set.preview_index(), None, "moving keeps it");
+
+        set.insert_after_active(Tab::preview("g"));
+        let at = set.preview_index().unwrap();
+        set.close(at);
+        set.reopen();
+        assert_eq!(set.preview_index(), None, "reopened tabs are kept");
+    }
+
+    #[test]
+    fn close_to_the_right_spares_pinned_tabs() {
+        let mut set = TabSet::new(Tab::new("a"));
+        set.insert_after_active(Tab::new("b"));
+        set.insert_after_active(Tab::new("c"));
+        set.insert_after_active(Tab::new("d"));
+        set.toggle_pin(3);
+        assert_eq!(labels(&set), ["d", "a", "b", "c"]);
+        set.activate(3);
+        set.close_to_right(1);
+        assert_eq!(labels(&set), ["d", "a"]);
+        assert_eq!(*set.active().focused(), "a", "the clicked tab takes over");
+        assert!(set.reopen());
+        assert_eq!(labels(&set), ["d", "a", "c"]);
     }
 }

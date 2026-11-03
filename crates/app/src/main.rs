@@ -1,5 +1,7 @@
 mod actions;
+mod chrome;
 mod files;
+mod names;
 mod pane;
 mod preferences;
 mod reader;
@@ -13,7 +15,10 @@ use reader::Reader;
 use std::{borrow::Cow, path::PathBuf};
 
 // Lucide icons beyond GPUI Kit's default component set, embedded one by one.
-gpui_kit::assets::icon_assets!(ExtraIcons, [ArrowDownUp, ChevronsDownUp, FolderPlus]);
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [ArrowDownUp, ChevronsDownUp, FolderPlus, Palette]
+);
 
 /// GPUI Kit's component icons plus `ExtraIcons`.
 struct AppAssets;

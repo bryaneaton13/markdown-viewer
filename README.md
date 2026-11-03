@@ -29,7 +29,8 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 - Find against the *rendered* text, with match highlighting and next/previous.
 - Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
 - **Workspaces** for several folders, listed together in the sidebar as folders that open and close, with **tabs** that can mix files from any of them, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
-- Back/forward history per pane, light/dark mode, adjustable text size, and automatic reload when a file changes on disk.
+- Editor-style **preview tabs**: a click previews a file in a reused italic tab, a double-click keeps it. Same-named files show the folder that tells them apart.
+- Back/forward history per pane, light/dark/system appearance with five chrome color presets (Neutral, Paper, Slate, Sage, Rose), adjustable text size, and automatic reload when a file changes on disk.
 - Finder and Dock "open with" support. Preferences persist between launches.
 - **Finder Quick Look**: press Space on a Markdown file for an offline rendered preview.
 
@@ -93,6 +94,7 @@ Press ⌘/ in the app for this list and the Finder setup notes.
 | ⌘\\ | Split side by side / separate into tabs |
 | ⌥⌘← / ⌥⌘→ | Focus left / right pane |
 | ⌃1 … ⌃9, ⌃⌘] / ⌃⌘[ | Switch workspace (in sidebar order) |
+| Click / double-click in tree | Preview in a reused tab / keep open |
 | ⌘-click / ⌥-click in tree | Open in new tab / other pane |
 | ⌘B or ⌃⌘S | Show/hide sidebar |
 | ⌘1 / ⌘2 | Focus tree / document |
@@ -102,7 +104,7 @@ Press ⌘/ in the app for this list and the Finder setup notes.
 | ⌘[ / ⌘] | Back / forward |
 | ⇧⌘M | Source / preview |
 | ⇧⌘I / ⇧⌘L | Properties / heading outline |
-| ⇧⌘D | Toggle light/dark |
+| ⇧⌘D | Toggle light/dark (palette button: Match System and color presets) |
 | ⌘+ / ⌘− / ⌘0 | Text size |
 | ⌘R | Reload |
 | ⌃⌘F | Full screen |
@@ -116,7 +118,7 @@ The app keeps running after you close its window; quit with ⌘Q. Settings, incl
 
 ## Limitations
 
-- At most two documents side by side per tab. No editing or custom themes.
+- At most two documents side by side per tab. No editing. Colors come from five built-in chrome presets, not custom themes.
 - Mermaid blocks render as code. Remote images are never fetched.
 - Files must be UTF-8 and at most 8 MiB.
 - Folder discovery respects ignore rules, skips hidden files, does not follow directory symlinks, and stops at 20,000 files or 32 levels deep.
@@ -142,7 +144,7 @@ scripts/                bundle/install, packaging, screenshots, validation
 docs/                   original research and design plan
 ```
 
-`scripts/shot.sh OUT.png FILE STATES` captures the real GPUI window with Metal `render_to_image`, with no screen-recording permission needed. `STATES` is a comma-separated list of `light`, `dark`, `browse` (add the file's folder as a workspace), `workspace:/path`, `switch:N` (activate the Nth workspace, from 0), `collapse:N` (open or close the Nth), `sidebar-focus`, `tab:relative/path.md`, `split:relative/path.md` (paths relative to the workspace; `~` for a space), `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help`. Set `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` to keep experiments away from your real settings.
+`scripts/shot.sh OUT.png FILE STATES` captures the real GPUI window with Metal `render_to_image`, with no screen-recording permission needed. `STATES` is a comma-separated list of `light`, `dark`, `browse` (add the file's folder as a workspace), `workspace:/path`, `switch:N` (activate the Nth workspace, from 0), `collapse:N` (open or close the Nth), `sidebar-focus`, `tab:relative/path.md`, `split:relative/path.md` (paths relative to the workspace; `~` for a space), `nosidebar`, `properties`, `source`, `outline`, `quick-open`, `find:query`, `help`, `preview:relative/path.md` (open in the preview tab), `palette:name` (`neutral`, `paper`, `slate`, `sage`, `rose`). Set `MARKDOWN_VIEWER_STATE_DIR=/path/to/scratch` to keep experiments away from your real settings.
 
 `scripts/check-quicklook.sh` compiles and calls the same Swift-to-Rust bridge the extension uses and writes `reports/quicklook.html`. It checks rendering, not Finder's choice of preview provider, so test that with an installed bundle.
 
