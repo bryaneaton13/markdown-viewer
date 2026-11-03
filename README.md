@@ -28,7 +28,7 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 - Folder tree and filtered **Quick Open** (⌘P) for `.md` and `.markdown` files.
 - Find against the *rendered* text, with match highlighting and next/previous.
 - Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
-- **Workspaces** for several folders, listed together in the sidebar as folders that open and close, each with its own **tabs**, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
+- **Workspaces** for several folders, listed together in the sidebar as folders that open and close, with **tabs** that can mix files from any of them, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
 - Back/forward history per pane, light/dark mode, adjustable text size, and automatic reload when a file changes on disk.
 - Finder and Dock "open with" support. Preferences persist between launches.
 - **Finder Quick Look**: press Space on a Markdown file for an offline rendered preview.
@@ -108,9 +108,9 @@ Press ⌘/ in the app for this list and the Finder setup notes.
 | ⌃⌘F | Full screen |
 | ⇧⌘W / ⌘Q | Close window / quit |
 
-Drag a tab onto the left or right half of the page to read it beside the current one, and drag a pane header back to the tab bar to separate them. A tab holds at most two panes.
+Drag a tab, or a file from the sidebar, to the left or right edge of the page to read it beside the current one, and drag a pane header back to the tab bar to separate them. A tab holds at most two panes. Tabs belong to the window, not to a folder, so files from different workspaces can sit side by side; each tab names its folder once they're mixed.
 
-You can also drag Markdown files in from Finder. Drop one on the left or right half of the page to open it in that pane, or drop two on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs. Folders dropped on the sidebar become workspaces.
+You can also drag Markdown files in from Finder. Drop one near the left or right edge of the page to split, or in the middle to open it in place (Back returns to the previous document). On a split, a file dropped on either pane replaces it. Drop two on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs. Folders dropped on the sidebar become workspaces.
 
 The app keeps running after you close its window; quit with ⌘Q. Settings, including open workspaces and tabs, live in `~/Library/Application Support/Markdown Viewer/settings.json`.
 

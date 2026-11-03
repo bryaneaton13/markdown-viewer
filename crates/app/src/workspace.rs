@@ -1,10 +1,10 @@
-//! A workspace: one folder's file tree plus the tabs opened from it. The
-//! window keeps several, lists them all in the sidebar, and shows one's tabs
-//! at a time. A workspace without a root ("Open Files") collects documents
-//! opened from outside every folder.
+//! A workspace: one folder's file tree. The window keeps several and lists
+//! them all in the sidebar; its tabs can show files from any of them. A
+//! workspace without a root ("Open Files") lists the open documents that
+//! live outside every folder.
 
-use crate::{files, pane::DocPane, sidebar, tabs::TabSet};
-use gpui_kit::{Entity, Task};
+use crate::{files, sidebar};
+use gpui_kit::Task;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -25,13 +25,12 @@ pub struct Workspace {
     pub limited: bool,
     /// Whether `files` reflects the folder (collapsed workspaces scan lazily).
     pub scanned: bool,
-    pub tabs: TabSet<Entity<DocPane>>,
     pub scan_generation: usize,
     pub _scan: Option<Task<()>>,
 }
 
 impl Workspace {
-    pub fn new(root: Option<PathBuf>, tabs: TabSet<Entity<DocPane>>) -> Self {
+    pub fn new(root: Option<PathBuf>) -> Self {
         Self {
             root,
             files: Vec::new(),
@@ -42,7 +41,6 @@ impl Workspace {
             indexing: false,
             limited: false,
             scanned: false,
-            tabs,
             scan_generation: 0,
             _scan: None,
         }
@@ -65,7 +63,8 @@ impl Workspace {
         }
     }
 
-    /// The loose workspace lists its open documents, in tab order.
+    /// The loose workspace lists the open documents outside every folder,
+    /// in tab order.
     pub fn set_loose_rows(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         let mut seen = HashSet::new();
         self.rows = paths

@@ -2,7 +2,9 @@
 //! two document panes side by side. Document state lives in `DocPane`; this
 //! view routes actions to the focused pane and owns workspaces and tabs.
 //! The sidebar lists every workspace as a folder that opens and closes
-//! (layout in `sidebar.rs`); the active one owns the tab strip.
+//! (layout in `sidebar.rs`). Tabs belong to the window and can mix files
+//! from any workspace; the active workspace follows the focused document
+//! and scopes Quick Open.
 
 use crate::{
     actions::*,
@@ -11,7 +13,7 @@ use crate::{
     preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
     sidebar::{self, Item, Sort},
     tabs::{Tab, TabSet},
-    workspace::{Workspace, home_for, now_millis},
+    workspace::{Workspace, home_for, name_of, now_millis},
 };
 use gpui_kit::{
     assets::IconName as Lucide,
@@ -40,6 +42,12 @@ const SIDEBAR_WIDTH: f32 = 242.;
 const SIDEBAR_ROW: f32 = 30.;
 /// Below this content width a split tab shows one pane at a time.
 const SPLIT_MIN_WIDTH: f32 = 720.;
+/// Dropping within this share of the panes' width from the left or right
+/// edge splits; the middle opens in place. Clamped so the edge stays easy to
+/// hit in narrow windows and the middle stays wide in large ones.
+const EDGE_SHARE: f32 = 0.25;
+const EDGE_MIN: f32 = 72.;
+const EDGE_MAX: f32 = 240.;
 
 /// Where a file opens.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -55,10 +63,46 @@ pub enum Target {
 /// Where a drag over the panes would land.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum DropZone {
-    /// The visible pane as a whole: an empty tab, or a narrow split.
+    /// An empty tab: one file opens, two open side by side.
     Whole,
+    /// Replace the visible pane's document: the middle of a single pane, or
+    /// a narrow split.
+    Here,
+    /// Split to this side of a single pane, or replace this pane of a split.
     Left,
     Right,
+}
+
+/// Where the pointer sits over the panes.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Spot {
+    /// Close to the left (`Some(false)`) or right (`Some(true)`) edge.
+    edge: Option<bool>,
+    right_half: bool,
+}
+
+impl Spot {
+    fn at(x: f32, left: f32, width: f32) -> Self {
+        let edge = (width * EDGE_SHARE)
+            .clamp(EDGE_MIN, EDGE_MAX)
+            .min(width / 2.);
+        let off = x - left;
+        Self {
+            edge: if off < edge {
+                Some(false)
+            } else if width - off < edge {
+                Some(true)
+            } else {
+                None
+            },
+            right_half: off > width / 2.,
+        }
+    }
+
+    fn of<T>(event: &DragMoveEvent<T>) -> Self {
+        let (b, x) = (event.bounds, event.event.position.x);
+        Self::at(f32::from(x), f32::from(b.left()), f32::from(b.size.width))
+    }
 }
 
 /// Markdown files and folders among paths dragged in from Finder; anything
@@ -80,6 +124,12 @@ fn droppable(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
 #[derive(Clone)]
 struct DraggedTab {
     from: usize,
+}
+
+/// Payload while a file is dragged out of the sidebar's tree.
+#[derive(Clone)]
+struct DraggedFile {
+    path: PathBuf,
 }
 
 /// Payload while a workspace's folder row is dragged to reorder.
@@ -126,7 +176,13 @@ pub struct Reader {
     tree_focus: FocusHandle,
     palette: Entity<CommandState>,
     workspaces: Vec<Workspace>,
+    /// The workspace Quick Open searches and the sidebar marks: the one the
+    /// focused document lives in, or the one last switched to.
     active: usize,
+    tabs: TabSet<Entity<DocPane>>,
+    /// The focused document `active` last followed, so a pane finishing a
+    /// load doesn't undo switching workspaces.
+    followed: Option<PathBuf>,
     picker: Option<bool>, // false: files, true: headings
     cursor: Option<Cursor>,
     tree_scroll: UniformListScrollHandle,
@@ -157,12 +213,29 @@ impl Reader {
         cx.set_global(FontSize(prefs.font_size));
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let tabs = prefs
+            .tabs
+            .iter()
+            .map(|t| {
+                let mut tab = Tab::new(Self::make_pane(Some(&t.left), window, cx));
+                tab.right = t
+                    .right
+                    .as_ref()
+                    .map(|r| Self::make_pane(Some(r), window, cx));
+                tab.focus_right = t.focus_right && tab.right.is_some();
+                tab.pinned = t.pinned;
+                tab
+            })
+            .collect();
+        let tabs = TabSet::restore(tabs, prefs.active_tab, || Self::make_pane(None, window, cx));
         let mut this = Self {
             focus,
             tree_focus: cx.focus_handle(),
             palette: cx.new(|cx| CommandState::new(window, cx)),
             workspaces: Vec::new(),
             active: 0,
+            tabs,
+            followed: None,
             picker: None,
             cursor: None,
             tree_scroll: UniformListScrollHandle::new(),
@@ -181,29 +254,14 @@ impl Reader {
             {
                 continue;
             }
-            let tabs = ws
-                .tabs
-                .iter()
-                .map(|t| {
-                    let mut tab = Tab::new(Self::make_pane(Some(&t.left), window, cx));
-                    tab.right = t
-                        .right
-                        .as_ref()
-                        .map(|r| Self::make_pane(Some(r), window, cx));
-                    tab.focus_right = t.focus_right && tab.right.is_some();
-                    tab.pinned = t.pinned;
-                    tab
-                })
-                .collect();
-            let tabs = TabSet::restore(tabs, ws.active_tab, || Self::make_pane(None, window, cx));
-            let mut workspace = Workspace::new(ws.root.clone(), tabs);
+            let mut workspace = Workspace::new(ws.root.clone());
             workspace.expanded = ws.expanded.iter().cloned().collect();
             workspace.open = !ws.collapsed;
             workspace.last_used = ws.last_used;
             this.workspaces.push(workspace);
         }
         if this.workspaces.is_empty() {
-            this.push_workspace(None, window, cx);
+            this.workspaces.push(Workspace::new(None));
         }
         this.active = this.prefs.active_workspace.min(this.workspaces.len() - 1);
         for ix in 0..this.workspaces.len() {
@@ -235,6 +293,9 @@ impl Reader {
 
     fn pane_changed(&mut self, cx: &mut Context<Self>) {
         self.refresh_loose(cx);
+        if self.focused_pane().read(cx).path != self.followed {
+            self.sync_active(cx);
+        }
         self.rewatch(cx);
         self.save(cx);
         cx.notify();
@@ -246,12 +307,8 @@ impl Reader {
         &self.workspaces[self.active]
     }
 
-    fn ws_mut(&mut self) -> &mut Workspace {
-        &mut self.workspaces[self.active]
-    }
-
     fn tab(&self) -> &Tab<Entity<DocPane>> {
-        self.ws().tabs.active()
+        self.tabs.active()
     }
 
     /// The pane navigation and the toolbar apply to.
@@ -267,10 +324,34 @@ impl Reader {
         self.focused_pane().update(cx, f)
     }
 
+    /// The workspace a file belongs to: the deepest folder containing it,
+    /// else "Open Files".
+    fn home_of(&self, path: &Path) -> Option<usize> {
+        let roots: Vec<_> = self.workspaces.iter().map(|w| w.root.as_deref()).collect();
+        home_for(&roots, path)
+    }
+
+    /// Whether `path` is listed under workspace `ix`: inside its folder, or
+    /// for "Open Files", outside every folder.
+    fn belongs(&self, ix: usize, path: &Path) -> bool {
+        match &self.workspaces[ix].root {
+            Some(root) => path.starts_with(root),
+            None => !self.workspaces.iter().any(|w| w.contains(path)),
+        }
+    }
+
+    fn pane_in(&self, ix: usize, pane: &Entity<DocPane>, cx: &App) -> bool {
+        pane.read(cx)
+            .path
+            .as_deref()
+            .is_some_and(|p| self.belongs(ix, p))
+    }
+
     // MARK: Opening
 
     /// Open from Finder, the command line, or the Open panel: a folder
-    /// becomes a workspace; a file opens in the workspace it belongs to.
+    /// becomes a workspace; a file opens in a tab already showing it, an
+    /// empty focused pane, or a new tab.
     pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = if path.is_absolute() {
             path
@@ -282,16 +363,6 @@ impl Reader {
         } else {
             self.open_file(path, window, cx);
         }
-    }
-
-    fn push_workspace(
-        &mut self,
-        root: Option<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let tabs = TabSet::new(Tab::new(Self::make_pane(None, window, cx)));
-        self.workspaces.push(Workspace::new(root, tabs));
     }
 
     /// Add a folder as a workspace and switch to it. A loose-files workspace
@@ -306,40 +377,24 @@ impl Reader {
             self.activate_workspace(ix, window, cx);
             return;
         }
-        let adopt = self.ws().root.is_none()
-            && self.ws().tabs.panes().all(|p| {
-                p.read(cx)
-                    .path
-                    .as_ref()
-                    .is_none_or(|f| f.starts_with(&path))
-            });
-        if adopt {
-            let ws = self.ws_mut();
+        let adopt = self
+            .workspaces
+            .iter()
+            .position(|w| w.root.is_none() && w.rows.iter().all(|r| r.path.starts_with(&path)));
+        if let Some(ix) = adopt {
+            let ws = &mut self.workspaces[ix];
             ws.root = Some(path);
             ws.expanded.clear();
             ws.scanned = false;
+            self.active = ix;
         } else {
-            self.push_workspace(Some(path), window, cx);
+            self.workspaces.push(Workspace::new(Some(path)));
             self.active = self.workspaces.len() - 1;
         }
         self.after_workspace_change(window, cx);
     }
 
-    /// Open a file in its workspace: switch to a tab already showing it, use
-    /// an empty focused pane, or open a new tab.
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let roots: Vec<_> = self.workspaces.iter().map(|w| w.root.as_deref()).collect();
-        let ix = match home_for(&roots, &path) {
-            Some(ix) => ix,
-            None => {
-                self.push_workspace(None, window, cx);
-                self.workspaces.len() - 1
-            }
-        };
-        if ix != self.active {
-            self.active = ix;
-            self.after_workspace_change(window, cx);
-        }
         if self.show_existing(&path, window, cx) {
         } else if self.focused_pane().read(cx).is_blank() {
             self.open_in(path, Target::Focused, window, cx);
@@ -348,10 +403,9 @@ impl Reader {
         }
     }
 
-    /// Bring forward the tab and pane already showing `path` in the active
-    /// workspace, if any.
+    /// Bring forward the tab and pane already showing `path`, if any.
     fn show_existing(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let showing = self.ws().tabs.tabs.iter().enumerate().find_map(|(i, t)| {
+        let showing = self.tabs.tabs.iter().enumerate().find_map(|(i, t)| {
             let right = t
                 .panes()
                 .position(|p| p.read(cx).path.as_deref() == Some(path))?;
@@ -360,9 +414,8 @@ impl Reader {
         let Some((tab, right)) = showing else {
             return false;
         };
-        let tabs = &mut self.ws_mut().tabs;
-        tabs.activate(tab);
-        tabs.active_mut().focus_right = right;
+        self.tabs.activate(tab);
+        self.tabs.active_mut().focus_right = right;
         self.after_tab_change(window, cx);
         true
     }
@@ -377,10 +430,7 @@ impl Reader {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if ws != self.active {
-            self.active = ws;
-            self.after_workspace_change(window, cx);
-        }
+        self.set_active(ws, cx);
         if target == Target::Focused && self.show_existing(&path, window, cx) {
             return;
         }
@@ -399,28 +449,29 @@ impl Reader {
             pane.update(cx, |p, cx| p.load_file(path.clone(), true, cx))
         };
         match target {
-            Target::Focused => load(&self.focused_pane(), cx),
+            Target::Focused => {
+                load(&self.focused_pane(), cx);
+                self.after_tab_change(window, cx);
+            }
             Target::NewTab => {
                 let pane = Self::make_pane(None, window, cx);
                 load(&pane, cx);
-                self.ws_mut().tabs.insert_after_active(Tab::new(pane));
+                self.tabs.insert_after_active(Tab::new(pane));
                 self.after_tab_change(window, cx);
             }
             Target::Split => {
                 if self.tab().is_split() {
-                    let tab = self.ws_mut().tabs.active_mut();
+                    let tab = self.tabs.active_mut();
                     tab.focus_right = !tab.focus_right;
                     load(&self.focused_pane(), cx);
                 } else {
                     let pane = Self::make_pane(None, window, cx);
                     load(&pane, cx);
-                    self.ws_mut().tabs.active_mut().split_with(pane, true);
+                    self.tabs.active_mut().split_with(pane, true);
                 }
                 self.after_tab_change(window, cx);
             }
         }
-        self.save(cx);
-        cx.notify();
     }
 
     fn prompt(&mut self, folder: bool, window: &Window, cx: &mut Context<Self>) {
@@ -450,7 +501,7 @@ impl Reader {
         .detach();
     }
 
-    // MARK: Dropping from Finder
+    // MARK: Dropping files
 
     /// Files and folders dropped outside the panes and tab strip: the same
     /// as opening them from Finder.
@@ -462,7 +513,7 @@ impl Reader {
         }
     }
 
-    /// Files dropped on the tab strip open as new tabs here.
+    /// Files dropped on the tab strip open as new tabs.
     fn drop_on_tabs(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         let (files, dirs) = droppable(paths);
         if !dirs.is_empty() {
@@ -473,12 +524,13 @@ impl Reader {
         }
     }
 
-    /// What dropping `paths` at the given spot of the panes would do, or
-    /// `None` when there is nothing to open.
+    /// What dropping `paths` (from Finder or the sidebar) at `spot` would
+    /// do, or `None` when there is nothing to open. Near an outer edge a
+    /// single pane splits; anywhere else the file opens in place.
     fn plan_drop(
         &self,
         paths: &[PathBuf],
-        right_half: bool,
+        spot: Spot,
         narrow: bool,
         cx: &App,
     ) -> Option<(DropZone, SharedString)> {
@@ -501,10 +553,21 @@ impl Reader {
             return None;
         }
         let tab = self.tab();
-        if tab.is_split() && narrow {
-            return Some((DropZone::Whole, format!("Open here{}", more(n - 1)).into()));
+        let side = |right: bool| {
+            if right {
+                (DropZone::Right, "right")
+            } else {
+                (DropZone::Left, "left")
+            }
+        };
+        if tab.is_split() {
+            if narrow {
+                return Some((DropZone::Here, format!("Open here{}", more(n - 1)).into()));
+            }
+            let (zone, side) = side(spot.right_half);
+            return Some((zone, format!("Replace {side} pane{}", more(n - 1)).into()));
         }
-        if !tab.is_split() && self.focused_pane().read(cx).is_blank() {
+        if self.focused_pane().read(cx).is_blank() {
             let hint = if n == 1 {
                 "Open".to_owned()
             } else {
@@ -512,22 +575,34 @@ impl Reader {
             };
             return Some((DropZone::Whole, hint.into()));
         }
-        let (zone, side) = if right_half {
-            (DropZone::Right, "right")
-        } else {
-            (DropZone::Left, "left")
-        };
-        let verb = if tab.is_split() {
-            "Replace"
-        } else {
-            "Open on the"
-        };
-        let hint = if tab.is_split() {
-            format!("{verb} {side} pane{}", more(n - 1))
-        } else {
-            format!("{verb} {side}{}", more(n - 1))
-        };
-        Some((zone, hint.into()))
+        Some(match spot.edge {
+            Some(right) => {
+                let (zone, side) = side(right);
+                (zone, format!("Open on the {side}{}", more(n - 1)).into())
+            }
+            None => (DropZone::Here, format!("Open here{}", more(n - 1)).into()),
+        })
+    }
+
+    /// Track a file drag over the panes, from Finder or the sidebar.
+    fn drag_files_over(
+        &mut self,
+        paths: &[PathBuf],
+        inside: bool,
+        spot: Spot,
+        narrow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let plan = inside
+            .then(|| self.plan_drop(paths, spot, narrow, cx))
+            .flatten();
+        let zone = plan.as_ref().map(|p| p.0);
+        let hint = plan.map(|p| p.1).unwrap_or_default();
+        if self.drop_zone != zone || self.drop_hint != hint {
+            self.drop_zone = zone;
+            self.drop_hint = hint;
+            cx.notify();
+        }
     }
 
     /// Files dropped on the panes: into the side they were dropped on,
@@ -544,7 +619,7 @@ impl Reader {
         let Some(first) = files.next() else {
             return;
         };
-        let keep = self.ws().tabs.active;
+        let keep = self.tabs.active;
         match zone {
             DropZone::Whole => {
                 let fill_split = !self.tab().is_split();
@@ -553,27 +628,46 @@ impl Reader {
                     self.open_in(second, Target::Split, window, cx);
                 }
             }
+            DropZone::Here => self.open_in(first, Target::Focused, window, cx),
             DropZone::Left | DropZone::Right => {
                 let right = zone == DropZone::Right;
                 if self.tab().is_split() {
-                    self.ws_mut().tabs.active_mut().focus_right = right;
+                    self.tabs.active_mut().focus_right = right;
                     self.open_in(first, Target::Focused, window, cx);
                 } else {
                     let pane = Self::make_pane(None, window, cx);
                     pane.update(cx, |p, cx| p.load_file(first, true, cx));
-                    self.ws_mut().tabs.active_mut().split_with(pane, right);
+                    self.tabs.active_mut().split_with(pane, right);
                 }
             }
         }
         for path in files {
             self.open_in(path, Target::NewTab, window, cx);
         }
-        self.ws_mut().tabs.activate(keep);
+        self.tabs.activate(keep);
         self.after_tab_change(window, cx);
     }
 
     // MARK: Workspaces
 
+    /// Make a workspace active without touching the tabs.
+    fn set_active(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.workspaces.len() {
+            return;
+        }
+        let changed = ix != self.active;
+        self.active = ix;
+        let ws = &mut self.workspaces[ix];
+        ws.last_used = now_millis();
+        // Unwatched folders may have changed since they were last scanned.
+        let root = ws.root.clone();
+        if !ws.scanned || (changed && !self.watched.iter().any(|(p, _)| Some(p) == root.as_ref())) {
+            self.scan(ix, cx);
+        }
+    }
+
+    /// Switch to a workspace from the keyboard or the sidebar: it opens in
+    /// the sidebar, and a tab showing one of its files comes forward.
     fn activate_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.workspaces.len() && ix != self.active {
             self.active = ix;
@@ -613,13 +707,24 @@ impl Reader {
         self.switch_to_nth(next, window, cx);
     }
 
+    /// Remove a workspace from the sidebar and close the panes showing its
+    /// files (⇧⌘T brings them back). Tabs from other workspaces stay.
     fn close_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix >= self.workspaces.len() {
             return;
         }
+        let close: HashSet<_> = self
+            .tabs
+            .panes()
+            .filter(|p| self.pane_in(ix, p, cx))
+            .map(|p| p.entity_id())
+            .collect();
+        let blank = Self::make_pane(None, window, cx);
+        self.tabs
+            .close_panes(|p| close.contains(&p.entity_id()), || blank);
         self.workspaces.remove(ix);
         if self.workspaces.is_empty() {
-            self.push_workspace(None, window, cx);
+            self.workspaces.push(Workspace::new(None));
         }
         if self.active > ix || self.active >= self.workspaces.len() {
             self.active = self.active.saturating_sub(1);
@@ -631,22 +736,35 @@ impl Reader {
             c.ws -= (c.ws > ix) as usize;
             Some(c)
         });
-        self.after_workspace_change(window, cx);
+        self.refresh_loose(cx);
+        self.sync_active(cx);
+        self.settle(window, cx);
     }
 
     fn after_workspace_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         self.drop_zone = None;
-        let ws = self.ws_mut();
-        ws.open = true;
-        ws.last_used = now_millis();
-        // Unwatched folders may have changed since they were last scanned.
-        let root = self.ws().root.clone();
-        if !self.ws().scanned || !self.watched.iter().any(|(p, _)| Some(p) == root.as_ref()) {
-            self.scan(self.active, cx);
+        self.workspaces[self.active].open = true;
+        self.set_active(self.active, cx);
+        // Bring forward a tab from this workspace unless one already shows.
+        let ix = self.active;
+        if !self.pane_in(ix, &self.focused_pane(), cx) {
+            let found = self.tabs.tabs.iter().enumerate().find_map(|(i, t)| {
+                if self.pane_in(ix, t.focused(), cx) {
+                    Some((i, t.focus_right))
+                } else {
+                    let right = t.panes().position(|p| self.pane_in(ix, p, cx))?;
+                    Some((i, right == 1))
+                }
+            });
+            if let Some((tab, right)) = found {
+                self.tabs.activate(tab);
+                self.tabs.active_mut().focus_right = right;
+            }
         }
-        self.rewatch(cx);
-        self.after_tab_change(window, cx);
+        self.followed = self.focused_pane().read(cx).path.clone();
+        self.refresh_loose(cx);
+        self.settle(window, cx);
     }
 
     /// Open or close a workspace's folder in the sidebar. This never changes
@@ -715,36 +833,65 @@ impl Reader {
         cx.notify();
     }
 
-    /// The loose-files workspace lists the documents open in its tabs.
+    /// "Open Files" lists the open documents outside every folder, and is
+    /// added back when one opens.
     fn refresh_loose(&mut self, cx: &App) {
-        for ws in &mut self.workspaces {
-            if ws.root.is_none() {
-                let paths: Vec<PathBuf> = ws
-                    .tabs
-                    .panes()
-                    .filter_map(|p| p.read(cx).path.clone())
-                    .collect();
+        let paths: Vec<PathBuf> = self
+            .tabs
+            .panes()
+            .filter_map(|p| p.read(cx).path.clone())
+            .filter(|p| !self.workspaces.iter().any(|w| w.contains(p)))
+            .collect();
+        match self.workspaces.iter_mut().find(|w| w.root.is_none()) {
+            Some(ws) => ws.set_loose_rows(paths),
+            None if !paths.is_empty() => {
+                let mut ws = Workspace::new(None);
+                ws.scanned = true;
                 ws.set_loose_rows(paths);
+                self.workspaces.push(ws);
             }
+            None => {}
+        }
+    }
+
+    /// The active workspace follows the focused document to its folder.
+    fn sync_active(&mut self, cx: &mut Context<Self>) {
+        let path = self.focused_pane().read(cx).path.clone();
+        self.followed = path.clone();
+        let Some(path) = path else {
+            return;
+        };
+        if !self.belongs(self.active, &path)
+            && let Some(ix) = self.home_of(&path)
+        {
+            self.set_active(ix, cx);
         }
     }
 
     // MARK: Tabs and panes
 
-    /// Keep keyboard focus inside the visible content after tabs or panes
-    /// change, so window actions keep reaching this view.
+    /// After tabs, panes or their documents change: the active workspace
+    /// follows the focused document.
     fn after_tab_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_loose(cx);
+        self.sync_active(cx);
+        self.settle(window, cx);
+    }
+
+    /// Keep keyboard focus inside the visible content, so window actions
+    /// keep reaching this view, and save.
+    fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tree_focus.is_focused(window) {
             self.focus_reader(window, cx);
         }
-        self.refresh_loose(cx);
+        self.rewatch(cx);
         self.save(cx);
         cx.notify();
     }
 
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pane = Self::make_pane(None, window, cx);
-        self.ws_mut().tabs.insert_after_active(Tab::new(pane));
+        self.tabs.insert_after_active(Tab::new(pane));
         self.after_tab_change(window, cx);
         if self.ws().root.is_some() {
             self.open_picker(false, window, cx);
@@ -757,14 +904,13 @@ impl Reader {
         if self.tab().is_split() {
             let right = self.tab().focus_right;
             self.close_pane(right, window, cx);
-        } else if self.ws().tabs.len() > 1 {
-            let ix = self.ws().tabs.active;
+        } else if self.tabs.len() > 1 {
+            let ix = self.tabs.active;
             self.close_tab(ix, window, cx);
         } else if !self.focused_pane().read(cx).is_blank() {
             let pane = Self::make_pane(None, window, cx);
-            let tabs = &mut self.ws_mut().tabs;
-            let old = std::mem::replace(&mut tabs.active_mut().left, pane);
-            tabs.remember_pane(old);
+            let old = std::mem::replace(&mut self.tabs.active_mut().left, pane);
+            self.tabs.remember_pane(old);
             self.after_tab_change(window, cx);
         } else {
             window.remove_window();
@@ -772,24 +918,22 @@ impl Reader {
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let tabs = &mut self.ws_mut().tabs;
-        if tabs.len() == 1 {
+        if self.tabs.len() == 1 {
             self.close_focused(window, cx);
-        } else if tabs.close(ix) {
+        } else if self.tabs.close(ix) {
             self.after_tab_change(window, cx);
         }
     }
 
     fn close_pane(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let tabs = &mut self.ws_mut().tabs;
-        if let Some(pane) = tabs.active_mut().take_pane(right) {
-            tabs.remember_pane(pane);
+        if let Some(pane) = self.tabs.active_mut().take_pane(right) {
+            self.tabs.remember_pane(pane);
             self.after_tab_change(window, cx);
         }
     }
 
     fn activate_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.ws_mut().tabs.activate(ix) {
+        if self.tabs.activate(ix) {
             self.after_tab_change(window, cx);
         }
     }
@@ -798,19 +942,19 @@ impl Reader {
     /// panes back into separate tabs.
     fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab().is_split() {
-            self.ws_mut().tabs.pane_to_tab(true, false);
+            self.tabs.pane_to_tab(true, false);
         } else {
             let pane = Self::make_pane(None, window, cx);
             if let Some(path) = self.focused_pane().read(cx).path.clone() {
                 pane.update(cx, |p, cx| p.load_file(path, true, cx));
             }
-            self.ws_mut().tabs.active_mut().split_with(pane, true);
+            self.tabs.active_mut().split_with(pane, true);
         }
         self.after_tab_change(window, cx);
     }
 
     fn focus_pane(&mut self, right: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = self.ws_mut().tabs.active_mut();
+        let tab = self.tabs.active_mut();
         if tab.is_split() && tab.focus_right != right {
             tab.focus_right = right;
             self.after_tab_change(window, cx);
@@ -856,8 +1000,8 @@ impl Reader {
     }
 
     /// Watch the folders of the active workspace and of every workspace
-    /// open in the sidebar, plus the folders of the active workspace's open
-    /// files that live outside it. Closed workspaces rescan when reopened.
+    /// open in the sidebar, plus the folders of open files outside those.
+    /// Closed workspaces rescan when reopened.
     fn rewatch(&mut self, cx: &mut Context<Self>) {
         let mut wanted: Vec<(PathBuf, bool)> = Vec::new();
         for (ix, ws) in self.workspaces.iter().enumerate() {
@@ -868,11 +1012,11 @@ impl Reader {
                 wanted.push((root.clone(), true));
             }
         }
-        let ws = self.ws();
-        for pane in ws.tabs.panes() {
+        for pane in self.tabs.panes() {
             if let Some(parent) = pane.read(cx).path.as_ref().and_then(|p| p.parent())
-                && !ws.contains(parent)
-                && !wanted.iter().any(|(p, _)| p == parent)
+                && !wanted
+                    .iter()
+                    .any(|(p, recursive)| p == parent || (*recursive && parent.starts_with(p)))
             {
                 wanted.push((parent.to_owned(), false));
             }
@@ -947,11 +1091,7 @@ impl Reader {
         for ix in affected {
             self.scan(ix, cx);
         }
-        let panes: Vec<_> = self
-            .workspaces
-            .iter()
-            .flat_map(|ws| ws.tabs.panes().cloned())
-            .collect();
+        let panes: Vec<_> = self.tabs.panes().cloned().collect();
         for pane in panes {
             let hit = pane
                 .read(cx)
@@ -977,23 +1117,24 @@ impl Reader {
                 SavedWorkspace {
                     root: ws.root.clone(),
                     expanded,
-                    tabs: ws
-                        .tabs
-                        .tabs
-                        .iter()
-                        .map(|t| SavedTab {
-                            left: t.left.read(cx).to_saved(),
-                            right: t.right.as_ref().map(|p| p.read(cx).to_saved()),
-                            focus_right: t.focus_right,
-                            pinned: t.pinned,
-                        })
-                        .collect(),
-                    active_tab: ws.tabs.active,
                     collapsed: !ws.open,
                     last_used: ws.last_used,
+                    ..Default::default()
                 }
             })
             .collect();
+        self.prefs.tabs = self
+            .tabs
+            .tabs
+            .iter()
+            .map(|t| SavedTab {
+                left: t.left.read(cx).to_saved(),
+                right: t.right.as_ref().map(|p| p.read(cx).to_saved()),
+                focus_right: t.focus_right,
+                pinned: t.pinned,
+            })
+            .collect();
+        self.prefs.active_tab = self.tabs.active;
         self.prefs.active_workspace = self.active;
         self.prefs.save();
     }
@@ -1283,7 +1424,14 @@ impl Reader {
         let pane = pane.read(cx);
         let (source, help, has_doc, copied) =
             (pane.source, pane.help, pane.document.is_some(), pane.copied);
-        let workspace = self.ws().root.as_ref().map(|_| self.ws().name());
+        // The folder the focused document lives in.
+        let home = match &pane.path {
+            Some(path) => self.home_of(path),
+            None => Some(self.active),
+        };
+        let workspace = home
+            .and_then(|ix| self.workspaces[ix].root.as_deref())
+            .map(|root| name_of(Some(root)));
         // 44px toolbar doubles as the title bar; traffic lights are centered in it (main.rs).
         TitleBar::new()
             .h(px(TOOLBAR_HEIGHT))
@@ -1335,7 +1483,7 @@ impl Reader {
                             .font_weight(FontWeight::MEDIUM)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            // Which workspace this tab strip belongs to.
+                            // Which workspace the document belongs to.
                             .when_some(workspace, |d, name| {
                                 d.child(
                                     div()
@@ -1562,11 +1710,11 @@ impl Reader {
                     .then(|| current.as_ref()?.file_name())
                     .flatten()
                     .map(|n| n.to_string_lossy().into_owned());
-                let docs = ws
+                let docs = self
                     .tabs
                     .tabs
                     .iter()
-                    .filter(|t| t.panes().any(|p| p.read(cx).path.is_some()))
+                    .filter(|t| t.panes().any(|p| self.pane_in(w, p, cx)))
                     .count();
                 let group: SharedString = format!("workspace-row-{w}").into();
                 let positions = positions.clone();
@@ -1689,7 +1837,7 @@ impl Reader {
                 let Some(entry) = self.row(item) else {
                     return div().id(("entry", ix)).into_any_element();
                 };
-                let selected = ws == self.active && current.as_ref() == Some(&entry.path);
+                let selected = current.as_ref() == Some(&entry.path);
                 let directory = entry.directory;
                 let icon = if !directory {
                     IconName::FileText
@@ -1699,6 +1847,16 @@ impl Reader {
                     IconName::ChevronRight
                 };
                 let path = entry.path.clone();
+                let drag = (!directory).then(|| {
+                    let name: SharedString = entry
+                        .path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into();
+                    (DraggedFile { path: path.clone() }, name)
+                });
                 row.id(("entry", ix))
                     .pl(px(22. + entry.depth as f32 * 14.))
                     .cursor_pointer()
@@ -1733,6 +1891,10 @@ impl Reader {
                         v.tree_focus.focus(w, cx);
                         v.tree_open(target, w, cx);
                     }))
+                    // Drag a file onto the page to open or split it there.
+                    .when_some(drag, |d, (payload, name)| {
+                        d.on_drag(payload, move |_, _, _, cx| cx.new(|_| Ghost(name.clone())))
+                    })
                     .into_any_element()
             }
             Item::Empty(ws) => {
@@ -1799,7 +1961,7 @@ impl Reader {
                         .gap_3()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child("Add a folder to browse its Markdown files. Each folder keeps its own tabs.")
+                        .child("Add a folder to browse its Markdown files. Tabs can show files from any folder.")
                         .child(
                             Button::new("empty-add-folder")
                                 .small()
@@ -1878,14 +2040,36 @@ impl Reader {
     fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (accent, muted) = (theme.accent, theme.muted);
-        let tabs = &self.ws().tabs;
+        let tabs = &self.tabs;
         let last = tabs.len() - 1;
         let weak = cx.entity().downgrade();
+        // Once tabs come from more than one folder, each names its folder.
+        let folders: Vec<Vec<usize>> = tabs
+            .tabs
+            .iter()
+            .map(|t| {
+                let mut homes: Vec<usize> = t
+                    .panes()
+                    .filter_map(|p| self.home_of(p.read(cx).path.as_deref()?))
+                    .filter(|&ix| self.workspaces[ix].root.is_some())
+                    .collect();
+                homes.dedup();
+                homes
+            })
+            .collect();
+        let mixed = folders.iter().flatten().collect::<HashSet<_>>().len() > 1;
         let mut strip = div().id("tab-strip").flex().min_w_0().overflow_x_scroll();
         for (ix, tab) in tabs.tabs.iter().enumerate() {
             let selected = ix == tabs.active;
             let (pinned, split) = (tab.pinned, tab.is_split());
             let label: SharedString = Self::tab_label(tab, cx).into();
+            let folder = mixed.then(|| {
+                folders[ix]
+                    .iter()
+                    .map(|&w| self.workspaces[w].name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
             let ghost = label.clone();
             let weak = weak.clone();
             strip = strip.child(
@@ -1931,6 +2115,16 @@ impl Reader {
                             .truncate()
                             .child(label),
                     )
+                    .when_some(folder.filter(|f| !f.is_empty()), |d, folder| {
+                        d.child(
+                            div()
+                                .max_w(px(120.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(folder),
+                        )
+                    })
                     .when(!pinned, |d| {
                         d.child(
                             Button::new(("close-tab", ix))
@@ -1952,12 +2146,12 @@ impl Reader {
                     })
                     .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                        this.ws_mut().tabs.move_tab(dragged.from, ix);
+                        this.tabs.move_tab(dragged.from, ix);
                         this.after_tab_change(window, cx);
                     }))
                     .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
-                        this.ws_mut().tabs.pane_to_tab(dragged.right, true);
+                        this.tabs.pane_to_tab(dragged.right, true);
                         this.after_tab_change(window, cx);
                     }))
                     .context_menu(move |menu, _, _| {
@@ -1976,7 +2170,7 @@ impl Reader {
                         menu.item(item(
                             if pinned { "Unpin Tab" } else { "Pin Tab" },
                             |v, ix, w, cx| {
-                                v.ws_mut().tabs.toggle_pin(ix);
+                                v.tabs.toggle_pin(ix);
                                 v.after_tab_change(w, cx);
                             },
                         ))
@@ -1987,14 +2181,14 @@ impl Reader {
                                 "Split Side by Side"
                             },
                             |v, ix, w, cx| {
-                                v.ws_mut().tabs.activate(ix);
+                                v.tabs.activate(ix);
                                 v.toggle_split(w, cx);
                             },
                         ))
                         .separator()
                         .item(item("Close Tab", |v, ix, w, cx| v.close_tab(ix, w, cx)))
                         .item(item("Close Other Tabs", |v, ix, w, cx| {
-                            v.ws_mut().tabs.close_others(ix);
+                            v.tabs.close_others(ix);
                             v.after_tab_change(w, cx);
                         }))
                     }),
@@ -2017,16 +2211,20 @@ impl Reader {
                     .h_full()
                     .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                        this.ws_mut().tabs.move_tab(dragged.from, last);
+                        this.tabs.move_tab(dragged.from, last);
                         this.after_tab_change(window, cx);
                     }))
                     .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
                         this.drop_on_tabs(dragged.paths(), window, cx)
                     }))
+                    .drag_over::<DraggedFile>(move |style, _, _, _| style.bg(accent))
+                    .on_drop(cx.listener(|this, dragged: &DraggedFile, window, cx| {
+                        this.open_in(dragged.path.clone(), Target::NewTab, window, cx)
+                    }))
                     .drag_over::<DraggedPane>(move |style, _, _, _| style.bg(accent))
                     .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
-                        this.ws_mut().tabs.pane_to_tab(dragged.right, true);
+                        this.tabs.pane_to_tab(dragged.right, true);
                         this.after_tab_change(window, cx);
                     })),
             )
@@ -2107,7 +2305,7 @@ impl Reader {
                     .tooltip("Swap panes")
                     .on_click(cx.listener(|this, _, window, cx| {
                         cx.stop_propagation();
-                        this.ws_mut().tabs.active_mut().swap();
+                        this.tabs.active_mut().swap();
                         this.after_tab_change(window, cx);
                     })),
             )
@@ -2216,15 +2414,19 @@ impl Reader {
             .flex()
             .on_drag_move::<DraggedTab>(cx.listener(
                 |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    // Only near an edge: a tab has nothing to do in the middle.
                     let from = event.drag(cx).from;
                     let inside = event.bounds.contains(&event.event.position);
-                    let zone = (inside && this.ws().tabs.can_split_with(from)).then(|| {
-                        if event.event.position.x > event.bounds.center().x {
-                            DropZone::Right
-                        } else {
-                            DropZone::Left
-                        }
-                    });
+                    let zone = Spot::of(event)
+                        .edge
+                        .filter(|_| inside && this.tabs.can_split_with(from))
+                        .map(|right| {
+                            if right {
+                                DropZone::Right
+                            } else {
+                                DropZone::Left
+                            }
+                        });
                     if this.drop_zone != zone {
                         this.drop_zone = zone;
                         this.drop_hint = SharedString::default();
@@ -2234,8 +2436,7 @@ impl Reader {
             ))
             .on_drop(cx.listener(|this, dragged: &DraggedTab, window, cx| {
                 if let Some(zone) = this.drop_zone.take() {
-                    this.ws_mut()
-                        .tabs
+                    this.tabs
                         .merge_into_active(dragged.from, zone == DropZone::Right);
                 }
                 this.after_tab_change(window, cx);
@@ -2243,20 +2444,22 @@ impl Reader {
             .on_drag_move::<ExternalPaths>(cx.listener(
                 move |this, event: &DragMoveEvent<ExternalPaths>, _, cx| {
                     let inside = event.bounds.contains(&event.event.position);
-                    let right_half = event.event.position.x > event.bounds.center().x;
-                    let plan = inside
-                        .then(|| this.plan_drop(event.drag(cx).paths(), right_half, narrow, cx))
-                        .flatten();
-                    let zone = plan.as_ref().map(|p| p.0);
-                    if this.drop_zone != zone {
-                        this.drop_zone = zone;
-                        this.drop_hint = plan.map(|p| p.1).unwrap_or_default();
-                        cx.notify();
-                    }
+                    let paths = event.drag(cx).paths().to_vec();
+                    this.drag_files_over(&paths, inside, Spot::of(event), narrow, cx);
                 },
             ))
             .on_drop(cx.listener(|this, dragged: &ExternalPaths, window, cx| {
                 this.drop_on_panes(dragged.paths(), window, cx)
+            }))
+            .on_drag_move::<DraggedFile>(cx.listener(
+                move |this, event: &DragMoveEvent<DraggedFile>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let paths = [event.drag(cx).path.clone()];
+                    this.drag_files_over(&paths, inside, Spot::of(event), narrow, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, dragged: &DraggedFile, window, cx| {
+                this.drop_on_panes(std::slice::from_ref(&dragged.path), window, cx)
             }))
             .child(body)
             .when_some(zone, |d, zone| {
@@ -2266,7 +2469,7 @@ impl Reader {
                         .top_0()
                         .bottom_0()
                         .map(|d| match zone {
-                            DropZone::Whole => d.left_0().right_0(),
+                            DropZone::Whole | DropZone::Here => d.left_0().right_0(),
                             DropZone::Left => d.left_0().w(relative(0.5)),
                             DropZone::Right => d.right_0().w(relative(0.5)),
                         })
@@ -2506,7 +2709,7 @@ impl Reader {
 
 impl Render for Reader {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_tabs = self.ws().tabs.len() > 1;
+        let show_tabs = self.tabs.len() > 1;
         div()
             .id("viewer")
             .key_context("Viewer")
@@ -2596,16 +2799,16 @@ impl Render for Reader {
             .on_action(cx.listener(|v, _: &NewTab, w, cx| v.new_tab(w, cx)))
             .on_action(cx.listener(|v, _: &CloseTab, w, cx| v.close_focused(w, cx)))
             .on_action(cx.listener(|v, _: &ReopenClosedTab, w, cx| {
-                if v.ws_mut().tabs.reopen() {
+                if v.tabs.reopen() {
                     v.after_tab_change(w, cx);
                 }
             }))
             .on_action(cx.listener(|v, _: &NextTab, w, cx| {
-                v.ws_mut().tabs.cycle(1);
+                v.tabs.cycle(1);
                 v.after_tab_change(w, cx);
             }))
             .on_action(cx.listener(|v, _: &PrevTab, w, cx| {
-                v.ws_mut().tabs.cycle(-1);
+                v.tabs.cycle(-1);
                 v.after_tab_change(w, cx);
             }))
             .on_action(cx.listener(|v, _: &ToggleSplit, w, cx| v.toggle_split(w, cx)))
@@ -2762,8 +2965,24 @@ mod tests {
         assert!(!pane(&view, cx, |p| p.find));
     }
 
+    #[test]
+    fn splitting_starts_near_the_edges() {
+        let at = |x: f32, width: f32| Spot::at(x, 100., width);
+        // Wide: a quarter of the width, capped.
+        assert_eq!(at(100. + 230., 1000.).edge, Some(false));
+        assert_eq!(at(100. + 250., 1000.).edge, None);
+        assert_eq!(at(100. + 770., 1000.).edge, Some(true));
+        assert_eq!(at(100. + 600., 1000.).edge, None);
+        assert!(at(100. + 600., 1000.).right_half);
+        // Narrow: at least 72px, never past the middle.
+        assert_eq!(at(100. + 70., 200.).edge, Some(false));
+        assert_eq!(at(100. + 100., 200.).edge, None);
+        assert_eq!(at(100. + 49., 100.).edge, Some(false));
+        assert_eq!(at(100. + 51., 100.).edge, Some(true));
+    }
+
     #[gpui_kit::test]
-    fn finder_drops_open_into_the_side_they_land_on(cx: &mut TestAppContext) {
+    fn drops_split_near_the_edges_and_open_in_the_middle(cx: &mut TestAppContext) {
         let tmp = folder(&[
             ("A.md", "# A"),
             ("B.md", "# B"),
@@ -2781,15 +3000,20 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
+        let middle = Spot::at(600., 0., 1000.);
+        let left_half = Spot::at(400., 0., 1000.);
+        let (left_edge, right_edge) = (Spot::at(40., 0., 1000.), Spot::at(960., 0., 1000.));
 
         // Nothing droppable: no zone.
-        let plan = view.read_with(cx, |v, cx| v.plan_drop(&[p("notes.txt")], true, false, cx));
+        let plan = view.read_with(cx, |v, cx| {
+            v.plan_drop(&[p("notes.txt")], middle, false, cx)
+        });
         assert!(plan.is_none());
 
         // Two files on an empty tab open side by side.
         with_reader(w, &view, cx, |v, w, cx| {
             let paths = [p("A.md"), p("B.md"), p("notes.txt")];
-            let (zone, hint) = v.plan_drop(&paths, true, false, cx).unwrap();
+            let (zone, hint) = v.plan_drop(&paths, middle, false, cx).unwrap();
             assert_eq!(zone, DropZone::Whole);
             assert_eq!(hint.as_ref(), "Open side by side");
             v.drop_zone = Some(zone);
@@ -2801,7 +3025,7 @@ mod tests {
         // as background tabs and the split tab stays active.
         with_reader(w, &view, cx, |v, w, cx| {
             let paths = [p("C.md"), p("D.md")];
-            let (zone, hint) = v.plan_drop(&paths, false, false, cx).unwrap();
+            let (zone, hint) = v.plan_drop(&paths, left_half, false, cx).unwrap();
             assert_eq!(zone, DropZone::Left);
             assert_eq!(hint.as_ref(), "Replace left pane (+1 tab)");
             v.drop_zone = Some(zone);
@@ -2809,24 +3033,36 @@ mod tests {
         });
         assert_eq!(paths_of(&view, cx), [p("C.md"), p("B.md")]);
         assert!(!view.read_with(cx, |v, _| v.tab().focus_right));
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 2);
 
-        // On a single document, the right half splits it.
+        // On a single document, the middle opens in place (Back returns)...
         with_reader(w, &view, cx, |v, w, cx| {
-            v.ws_mut().tabs.activate(1);
-            let (zone, _) = v.plan_drop(&[p("A.md")], true, false, cx).unwrap();
-            assert_eq!(zone, DropZone::Right);
+            v.tabs.activate(1);
+            let (zone, hint) = v.plan_drop(&[p("A.md")], middle, false, cx).unwrap();
+            assert_eq!((zone, hint.as_ref()), (DropZone::Here, "Open here"));
             v.drop_zone = Some(zone);
             v.drop_on_panes(&[p("A.md")], w, cx);
         });
-        assert_eq!(paths_of(&view, cx), [p("D.md"), p("A.md")]);
+        assert_eq!(paths_of(&view, cx), [p("A.md")]);
+        assert!(pane(&view, cx, |p| p.can_go_back()));
+
+        // ...and only the edges split it.
+        with_reader(w, &view, cx, |v, w, cx| {
+            let (zone, hint) = v.plan_drop(&[p("B.md")], left_edge, false, cx).unwrap();
+            assert_eq!((zone, hint.as_ref()), (DropZone::Left, "Open on the left"));
+            let (zone, _) = v.plan_drop(&[p("B.md")], right_edge, false, cx).unwrap();
+            assert_eq!(zone, DropZone::Right);
+            v.drop_zone = Some(zone);
+            v.drop_on_panes(&[p("B.md")], w, cx);
+        });
+        assert_eq!(paths_of(&view, cx), [p("A.md"), p("B.md")]);
         assert!(view.read_with(cx, |v, _| v.tab().focus_right));
 
         // Files on the tab strip open as new tabs.
         with_reader(w, &view, cx, |v, w, cx| {
             v.drop_on_tabs(&[p("B.md"), p("notes.txt")], w, cx)
         });
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 3);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 3);
         assert_eq!(paths_of(&view, cx), [p("B.md")]);
     }
 
@@ -2882,7 +3118,7 @@ mod tests {
             w.input("Alpha", cx);
         });
         interact(w, cx, |w, cx| w.press("cmd-enter", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 2);
         assert_eq!(pane(&view, cx, |p| p.title()), "Alpha.md");
 
         interact(w, cx, |w, cx| {
@@ -2905,7 +3141,7 @@ mod tests {
             v.open_in(a.clone(), Target::Focused, w, cx);
             v.open_in(b.clone(), Target::NewTab, w, cx);
         });
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 2);
 
         // ⌘\ shows B twice side by side; actions follow the focused pane.
         interact(w, cx, |w, cx| w.press("cmd-\\", cx));
@@ -2923,17 +3159,17 @@ mod tests {
         interact(w, cx, |w, cx| w.press("cmd-w", cx));
         assert!(!view.read_with(cx, |v, _| v.tab().is_split()));
         interact(w, cx, |w, cx| w.press("cmd-w", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 1);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 1);
         assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(a));
         interact(w, cx, |w, cx| w.press("cmd-shift-t", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.len()), 2);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 2);
         assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(b));
         interact(w, cx, |w, cx| w.press("ctrl-tab", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.ws().tabs.active), 0);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.active), 0);
     }
 
     #[gpui_kit::test]
-    fn workspaces_keep_their_own_tabs_and_files_route_home(cx: &mut TestAppContext) {
+    fn tabs_mix_workspaces_and_the_active_one_follows_focus(cx: &mut TestAppContext) {
         let one = folder(&[("One.md", "# One")]);
         let two = folder(&[("Two.md", "# Two")]);
         let loose = folder(&[("Loose.md", "# Loose")]);
@@ -2943,20 +3179,39 @@ mod tests {
             v.open_in(one.path().join("One.md"), Target::Focused, w, cx);
             v.add_folder(two.path().into(), w, cx);
         });
-        // The empty Files workspace was adopted by the first folder.
+        // The empty Files workspace was adopted by the first folder, and
+        // switching folders keeps the tabs.
         assert_eq!(
             view.read_with(cx, |v, _| (v.workspaces.len(), v.active)),
             (2, 1)
         );
-        assert!(pane(&view, cx, |p| p.is_blank()));
+        assert_eq!(pane(&view, cx, |p| p.title()), "One.md");
 
-        // A file under folder one goes back to its workspace and tab.
+        // A file from the other folder opens beside it in the same strip.
         with_reader(w, &view, cx, |v, w, cx| {
-            v.open_path(one.path().join("One.md"), w, cx)
+            v.open_from_tree(1, two.path().join("Two.md"), Target::NewTab, w, cx)
+        });
+        assert_eq!(view.read_with(cx, |v, _| (v.tabs.len(), v.active)), (2, 1));
+        // Each tab names its folder once they're mixed.
+        let folders = view.read_with(cx, |v, cx| {
+            v.tabs
+                .tabs
+                .iter()
+                .map(|t| v.home_of(t.left.read(cx).path.as_deref().unwrap()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(folders, [Some(0), Some(1)]);
+
+        // The active workspace follows the focused tab.
+        with_reader(w, &view, cx, |v, w, cx| v.activate_tab(0, w, cx));
+        assert_eq!(view.read_with(cx, |v, _| v.active), 0);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.open_path(two.path().join("Two.md"), w, cx)
         });
         assert_eq!(
-            view.read_with(cx, |v, _| (v.active, v.ws().tabs.len())),
-            (0, 1)
+            view.read_with(cx, |v, _| (v.tabs.len(), v.tabs.active, v.active)),
+            (2, 1, 1),
+            "an open file comes forward"
         );
 
         // A file outside every folder gets a Files workspace.
@@ -2964,22 +3219,32 @@ mod tests {
             v.open_path(loose.path().join("Loose.md"), w, cx)
         });
         assert_eq!(
-            view.read_with(cx, |v, _| (v.workspaces.len(), v.active)),
-            (3, 2)
+            view.read_with(cx, |v, _| (v.workspaces.len(), v.active, v.tabs.len())),
+            (3, 2, 3)
         );
         assert_eq!(pane(&view, cx, |p| p.title()), "Loose.md");
 
-        interact(w, cx, |w, cx| w.press("ctrl-2", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.active), 1);
-        assert!(
-            view.read_with(cx, |v, _| v.ws().files.len() == 1),
-            "rescanned on switch"
-        );
+        // Switching workspaces brings forward one of its tabs.
+        interact(w, cx, |w, cx| w.press("ctrl-1", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.active), 0);
+        assert_eq!(pane(&view, cx, |p| p.title()), "One.md");
+
+        // Closing a workspace closes only its tabs.
+        with_reader(w, &view, cx, |v, w, cx| v.close_workspace(0, w, cx));
+        let titles = view.read_with(cx, |v, cx| {
+            v.tabs
+                .tabs
+                .iter()
+                .map(|t| t.left.read(cx).title())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(titles, ["Two.md", "Loose.md"]);
 
         // Saved and restored.
-        let saved = view.read_with(cx, |v, _| v.prefs.workspaces.clone());
-        assert_eq!(saved.len(), 3);
-        assert_eq!(saved[0].tabs[0].left.path, Some(one.path().join("One.md")));
+        let saved = view.read_with(cx, |v, _| v.prefs.clone());
+        assert_eq!(saved.workspaces.len(), 2);
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.tabs[0].left.path, Some(two.path().join("Two.md")));
     }
 
     #[gpui_kit::test]
@@ -3137,7 +3402,7 @@ mod tests {
             v.open_from_tree(v.active, tmp.path().join("A.md"), Target::Focused, w, cx)
         });
         assert_eq!(
-            view.read_with(cx, |v, _| (v.ws().tabs.len(), v.ws().tabs.active)),
+            view.read_with(cx, |v, _| (v.tabs.len(), v.tabs.active)),
             (2, 0)
         );
     }

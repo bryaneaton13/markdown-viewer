@@ -11,6 +11,9 @@ pub struct Preferences {
     /// Open workspaces, in sidebar order.
     pub workspaces: Vec<SavedWorkspace>,
     pub active_workspace: usize,
+    /// The window's tabs. They can mix files from any workspace.
+    pub tabs: Vec<SavedTab>,
+    pub active_tab: usize,
     /// How the sidebar orders folder workspaces.
     pub sidebar_sort: Sort,
     /// Pre-0.2 single folder / file. Read once and folded into `workspaces`.
@@ -20,14 +23,18 @@ pub struct Preferences {
     pub file: Option<PathBuf>,
 }
 
-/// One workspace: a folder (or loose files when `root` is `None`) and its tabs.
+/// One workspace: a folder, or loose files when `root` is `None`.
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Debug)]
 #[serde(default)]
 pub struct SavedWorkspace {
     pub root: Option<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub expanded: Vec<PathBuf>,
+    /// 0.2 previews kept tabs per workspace. Read once and folded into the
+    /// window's tabs.
+    #[serde(skip_serializing)]
     pub tabs: Vec<SavedTab>,
+    #[serde(skip_serializing)]
     pub active_tab: usize,
     /// Closed in the sidebar.
     #[serde(skip_serializing_if = "is_false")]
@@ -73,6 +80,8 @@ impl Default for Preferences {
             dark: None,
             workspaces: Vec::new(),
             active_workspace: 0,
+            tabs: Vec::new(),
+            active_tab: 0,
             sidebar_sort: Sort::Manual,
             folder: None,
             file: None,
@@ -100,8 +109,8 @@ impl Preferences {
         prefs.normalized()
     }
 
-    /// Clamp values and fold the pre-workspace `folder` / `file` keys into a
-    /// single workspace.
+    /// Clamp values, fold the pre-workspace `folder` / `file` keys into a
+    /// single workspace, and gather per-workspace tabs into the window's.
     pub fn normalized(mut self) -> Self {
         self.font_size = self.font_size.clamp(12., 26.);
         let (folder, file) = (self.folder.take(), self.file.take());
@@ -109,19 +118,45 @@ impl Preferences {
             let root = folder.filter(|f| file.as_ref().is_none_or(|p| p.starts_with(f)));
             self.workspaces.push(SavedWorkspace {
                 root,
-                tabs: vec![SavedTab {
-                    left: SavedPane {
-                        path: file,
-                        source: false,
-                    },
-                    ..Default::default()
-                }],
                 ..Default::default()
             });
+            self.tabs = vec![SavedTab {
+                left: SavedPane {
+                    path: file,
+                    source: false,
+                },
+                ..Default::default()
+            }];
         }
         self.active_workspace = self
             .active_workspace
             .min(self.workspaces.len().saturating_sub(1));
+        if self.tabs.is_empty() {
+            // The active workspace's tabs first, so its active tab stays put.
+            let mut order: Vec<usize> = (0..self.workspaces.len()).collect();
+            if !order.is_empty() {
+                order.remove(self.active_workspace);
+                order.insert(0, self.active_workspace);
+            }
+            for (n, ix) in order.into_iter().enumerate() {
+                let ws = &mut self.workspaces[ix];
+                let active = ws.active_tab;
+                for (i, tab) in std::mem::take(&mut ws.tabs).into_iter().enumerate() {
+                    let blank = tab.left.path.is_none()
+                        && tab.right.as_ref().is_none_or(|r| r.path.is_none());
+                    if n == 0 && i == active {
+                        self.active_tab = self.tabs.len();
+                    } else if blank {
+                        continue;
+                    }
+                    self.tabs.push(tab);
+                }
+            }
+        }
+        for ws in &mut self.workspaces {
+            ws.tabs.clear();
+        }
+        self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
         self
     }
 
@@ -155,9 +190,8 @@ mod tests {
         let prefs = prefs.normalized();
         assert_eq!(prefs.font_size, 26.);
         assert_eq!(prefs.workspaces.len(), 1);
-        let ws = &prefs.workspaces[0];
-        assert_eq!(ws.root, Some("/notes".into()));
-        assert_eq!(ws.tabs[0].left.path, Some("/notes/a.md".into()));
+        assert_eq!(prefs.workspaces[0].root, Some("/notes".into()));
+        assert_eq!(prefs.tabs[0].left.path, Some("/notes/a.md".into()));
         let json = serde_json::to_string(&prefs).unwrap();
         assert!(
             !json.contains("\"folder\""),
@@ -171,34 +205,67 @@ mod tests {
         prefs.workspaces.push(SavedWorkspace {
             root: Some("/a".into()),
             expanded: vec!["/a/notes".into()],
-            tabs: vec![
-                SavedTab {
-                    left: SavedPane {
-                        path: Some("/a/x.md".into()),
-                        source: true,
-                    },
-                    right: Some(SavedPane {
-                        path: Some("/a/y.md".into()),
-                        source: false,
-                    }),
-                    focus_right: true,
-                    pinned: true,
-                },
-                SavedTab::default(),
-            ],
-            active_tab: 1,
             collapsed: true,
             last_used: 42,
+            ..Default::default()
         });
+        prefs.tabs = vec![
+            SavedTab {
+                left: SavedPane {
+                    path: Some("/a/x.md".into()),
+                    source: true,
+                },
+                right: Some(SavedPane {
+                    path: Some("/a/y.md".into()),
+                    source: false,
+                }),
+                focus_right: true,
+                pinned: true,
+            },
+            SavedTab::default(),
+        ];
+        prefs.active_tab = 1;
         prefs.active_workspace = 3;
         prefs.sidebar_sort = Sort::Recent;
         let back: Preferences =
             serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
         let back = back.normalized();
         assert_eq!(back.workspaces, prefs.workspaces);
+        assert_eq!((&back.tabs, back.active_tab), (&prefs.tabs, 1));
         assert_eq!(back.active_workspace, 0, "clamped");
         assert_eq!(back.sidebar_sort, Sort::Recent);
         let json = serde_json::to_string(&back).unwrap();
         assert!(json.contains(r#""sidebar_sort":"recent""#));
+    }
+
+    #[test]
+    fn per_workspace_tabs_fold_into_the_window() {
+        let tab = |path: &str| SavedTab {
+            left: SavedPane {
+                path: Some(path.into()),
+                source: false,
+            },
+            ..Default::default()
+        };
+        let prefs: Preferences = serde_json::from_value(serde_json::json!({
+            "active_workspace": 1,
+            "workspaces": [
+                {"root": "/a", "tabs": [tab("/a/1.md"), SavedTab::default()], "active_tab": 0},
+                {"root": "/b", "tabs": [tab("/b/1.md"), tab("/b/2.md")], "active_tab": 1},
+            ],
+        }))
+        .unwrap();
+        let prefs = prefs.normalized();
+        let paths: Vec<_> = prefs
+            .tabs
+            .iter()
+            .map(|t| t.left.path.clone().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [PathBuf::from("/b/1.md"), "/b/2.md".into(), "/a/1.md".into()]
+        );
+        assert_eq!(prefs.active_tab, 1, "blank tabs are dropped");
+        assert!(prefs.workspaces.iter().all(|w| w.tabs.is_empty()));
     }
 }

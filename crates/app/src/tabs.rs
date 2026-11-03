@@ -1,4 +1,4 @@
-//! Tabs within one workspace. A tab shows one document, or two side by side.
+//! The window's tabs, which can mix files from any workspace. A tab shows one document, or two side by side.
 //! The split is capped at two panes: a tab that is already split can't take
 //! another pane, and a split tab can't be dropped into another tab.
 //!
@@ -214,6 +214,38 @@ impl<P> TabSet<P> {
         }
     }
 
+    /// Close every pane `close` matches, remembering them for `reopen`. A
+    /// split keeps its other pane; a tab left with none closes. If no tab is
+    /// left, one with a `blank` pane takes their place.
+    pub fn close_panes(&mut self, mut close: impl FnMut(&P) -> bool, blank: impl FnOnce() -> P) {
+        let (active_id, was) = (self.tabs[self.active].id, self.active);
+        let mut kept = Vec::new();
+        for mut tab in std::mem::take(&mut self.tabs) {
+            if tab.right.as_ref().is_some_and(&mut close)
+                && let Some(pane) = tab.take_pane(true)
+            {
+                self.remember_pane(pane);
+            }
+            if !close(&tab.left) {
+                kept.push(tab);
+            } else if let Some(pane) = tab.take_pane(false) {
+                self.remember_pane(pane);
+                kept.push(tab);
+            } else {
+                self.remember(tab);
+            }
+        }
+        if kept.is_empty() {
+            kept.push(Tab::new(blank()));
+        }
+        self.tabs = kept;
+        self.active = self
+            .tabs
+            .iter()
+            .position(|t| t.id == active_id)
+            .unwrap_or(was.min(self.tabs.len() - 1));
+    }
+
     /// Remember a single pane closed out of a split.
     pub fn remember_pane(&mut self, pane: P) {
         self.remember(Tab::new(pane));
@@ -374,6 +406,22 @@ mod tests {
         assert!(set.pane_to_tab(true, false));
         assert_eq!(labels(&set), ["a", "c", "b"]);
         assert_eq!(set.active, 0);
+    }
+
+    #[test]
+    fn closing_panes_keeps_the_other_side_of_a_split() {
+        let mut set = TabSet::new(Tab::new("a1"));
+        set.insert_after_active(Tab::new("b1"));
+        set.active_mut().split_with("a2", true);
+        set.insert_after_active(Tab::new("a3"));
+        set.activate(1);
+        assert_eq!(labels(&set), ["a1", "b1|a2", "a3"]);
+        set.close_panes(|p| p.starts_with('a'), || "blank");
+        assert_eq!(labels(&set), ["b1"]);
+        assert_eq!(set.active, 0);
+        assert!(set.reopen(), "closed panes can come back");
+        set.close_panes(|_| true, || "blank");
+        assert_eq!(labels(&set), ["blank"]);
     }
 
     #[test]
