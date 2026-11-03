@@ -16,7 +16,6 @@ const QUIP_FOR: Duration = Duration::from_millis(3500);
 
 const QUIPS: [&str; 8] = [
     "Boop!",
-    "Hey, that tickles.",
     "Wheee!",
     "Headings are my favourite snack.",
     "I've read worse. I've also read better.",
