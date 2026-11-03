@@ -10,6 +10,38 @@ const appearances = {
     alt: "Markdown Viewer in dark mode with find highlighting.",
     caption: "Dark mode · Find highlights matches in the rendered text.",
   },
+  split: {
+    image: "screenshots/split.png",
+    alt: "Two documents side by side in a split, with the Fjord theme.",
+    caption: "Split view · Two documents side by side (⌘\\), Fjord theme.",
+  },
+  synthwave: {
+    image: "screenshots/theme-synthwave.png",
+    alt: "The Synthwave theme: purple chrome with magenta accents and two tabs.",
+    caption: "Synthwave · A fun theme colors icons, the active tab and the status bar.",
+    frame: "dark",
+  },
+  campfire: {
+    image: "screenshots/theme-campfire.png",
+    alt: "The Campfire theme: warm brown chrome with orange accents and two tabs.",
+    caption: "Campfire · Themes never recolor the page itself.",
+    frame: "dark",
+  },
+  lagoon: {
+    image: "screenshots/theme-lagoon.png",
+    alt: "The Lagoon theme in light mode: teal status bar and blue file icons.",
+    caption: "Lagoon · Every theme has light and dark variants.",
+  },
+  bubblegum: {
+    image: "screenshots/theme-bubblegum.png",
+    alt: "The Bubblegum theme in light mode: pink chrome and green file icons.",
+    caption: "Bubblegum · Pick a theme from the palette button.",
+  },
+  preview: {
+    image: "screenshots/preview-tab.png",
+    alt: "A preview tab with an italic title that the next click in the sidebar reuses.",
+    caption: "Preview tabs · Click to peek in an italic tab, double-click to keep it.",
+  },
 };
 
 const picker = document.querySelector(".theme-picker");
@@ -26,7 +58,7 @@ if (picker && preview && caption && frame) {
     preview.src = appearance.image;
     preview.alt = appearance.alt;
     caption.textContent = appearance.caption;
-    frame.dataset.previewTheme = button.dataset.theme;
+    frame.dataset.previewTheme = appearance.frame || (button.dataset.theme === "dark" ? "dark" : "light");
     for (const option of picker.querySelectorAll("button")) {
       option.setAttribute("aria-pressed", String(option === button));
     }

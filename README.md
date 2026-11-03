@@ -38,6 +38,19 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
   <img src="docs/screenshots/dark.png" alt="Dark mode with find highlighting" width="800">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/split.png" alt="Two documents side by side in a split, with the Fjord theme" width="800">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/theme-synthwave.png" alt="Synthwave theme" width="395">
+  <img src="docs/screenshots/theme-lagoon.png" alt="Lagoon theme in light mode" width="395">
+</p>
+<p align="center">
+  <img src="docs/screenshots/theme-campfire.png" alt="Campfire theme" width="395">
+  <img src="docs/screenshots/preview-tab.png" alt="A preview tab with an italic title" width="395">
+</p>
+
 ## Install
 
 ### Download (Apple Silicon)
