@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/bryaneaton13/markdown-viewer/actions/workflows/ci.yml"><img src="https://github.com/bryaneaton13/markdown-viewer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/macOS-13%2B-lightgrey.svg" alt="macOS 13+">
 </p>
