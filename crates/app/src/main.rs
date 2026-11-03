@@ -1,12 +1,37 @@
 mod actions;
 mod files;
+mod pane;
 mod preferences;
 mod reader;
+mod sidebar;
+mod tabs;
+mod workspace;
 
 use actions::*;
 use gpui_kit::{base::Root, component::TitleBar, *};
 use reader::Reader;
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
+
+// Lucide icons beyond GPUI Kit's default component set, embedded one by one.
+gpui_kit::assets::icon_assets!(ExtraIcons, [ArrowDownUp, ChevronsDownUp, FolderPlus]);
+
+/// GPUI Kit's component icons plus `ExtraIcons`.
+struct AppAssets;
+impl AssetSource for AppAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        match ExtraIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
 
 struct MainWindow(Option<WindowHandle<Root>>, Option<Entity<Reader>>);
 impl Global for MainWindow {}
@@ -15,12 +40,14 @@ fn open(path: Option<PathBuf>, cx: &mut App) {
     let existing = cx.global::<MainWindow>();
     if let (Some(handle), Some(view)) = (existing.0, existing.1.clone())
         && handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                if let Some(path) = path.clone() {
+                    view.update(cx, |v, cx| v.open_path(path, window, cx));
+                }
+            })
             .is_ok()
     {
-        if let Some(path) = path {
-            view.update(cx, |v, cx| v.open_path(path, cx));
-        }
         return;
     }
     let options = WindowOptions {
@@ -47,7 +74,7 @@ fn open(path: Option<PathBuf>, cx: &mut App) {
 fn main() {
     let paths: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let app = gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(AppAssets)
         .with_quit_mode(QuitMode::Explicit);
     let (tx, rx) = async_channel::unbounded();
     app.on_open_urls(move |urls| {
@@ -117,7 +144,13 @@ fn screenshot(cx: &mut App) {
         cx.background_executor()
             .timer(std::time::Duration::from_millis(700))
             .await;
-        let result = window.update(cx, |_, window, _| window.render_to_image());
+        // Draw now rather than trusting the last frame: an occluded or
+        // unattended window may not have repainted since launch.
+        let result = cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            window.render_to_image()
+        });
         let ok = match result {
             Ok(Ok(image)) => image.save(&out).map(|_| eprintln!("Saved {out}")).is_ok(),
             other => {
