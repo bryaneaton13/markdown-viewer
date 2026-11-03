@@ -14,7 +14,7 @@ const NAP_AFTER: Duration = Duration::from_secs(14);
 /// How long a quip stays before the mood line comes back.
 const QUIP_FOR: Duration = Duration::from_millis(3500);
 
-const QUIPS: [&str; 8] = [
+const QUIPS: &[&str] = &[
     "Boop!",
     "Wheee!",
     "Headings are my favourite snack.",
