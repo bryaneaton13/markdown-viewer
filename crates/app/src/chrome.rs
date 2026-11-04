@@ -111,6 +111,7 @@ impl Palette {
         Palette::Lagoon,
         Palette::Bubblegum,
     ];
+    #[cfg(test)]
     pub const ALL: [Palette; 7] = [
         Palette::Classic,
         Palette::Paper,
