@@ -54,8 +54,6 @@ pub struct DocPane {
     history_index: usize,
     pub loading: bool,
     pub error: Option<String>,
-    /// The shown text opens with a level-one heading, which gets more room above it.
-    leads_with_h1: bool,
     /// Restored from settings but not read yet; loads when first shown.
     dormant: bool,
     generation: usize,
@@ -112,7 +110,6 @@ impl DocPane {
             history_index: 0,
             loading: false,
             error: None,
-            leads_with_h1: true,
             dormant: false,
             generation: 0,
             _load: None,
@@ -218,7 +215,6 @@ impl DocPane {
                         this.error = Some(e);
                         this.document = None;
                         this.stats = None;
-                        this.leads_with_h1 = true;
                         this.text.update(cx, |s, cx| s.set_text("# Unable to read this file\n\nCheck that it still exists and is readable, then press **⌘R** to retry.", cx));
                     }
                 }
@@ -251,7 +247,6 @@ impl DocPane {
         } else {
             WELCOME.to_owned()
         };
-        self.leads_with_h1 = leads_with_h1(&content);
         self.text.update(cx, |s, cx| s.set_text(&content, cx));
         cx.notify();
     }
@@ -453,7 +448,7 @@ impl Render for DocPane {
         let lead = if shows_logo {
             0.
         } else {
-            let lead = font_size * if self.leads_with_h1 { 2. } else { 1.5 };
+            let lead = font_size * 2.5;
             if shows_properties { lead * 0.5 } else { lead }
         };
         let top = (px(lead) - scrolled).clamp(px(0.), px(lead));
@@ -636,36 +631,5 @@ impl Render for DocPane {
                         reader.into_any_element()
                     }),
             )
-    }
-}
-
-/// Whether Markdown opens with a level-one heading, ATX or setext.
-fn leads_with_h1(text: &str) -> bool {
-    let mut lines = text.lines().skip_while(|l| l.trim().is_empty());
-    let Some(first) = lines.next() else {
-        return false;
-    };
-    if let Some(rest) = first.trim_start().strip_prefix('#') {
-        return rest.is_empty() || rest.starts_with([' ', '\t']);
-    }
-    lines
-        .next()
-        .is_some_and(|l| !l.trim().is_empty() && l.trim().chars().all(|c| c == '='))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::leads_with_h1;
-
-    #[test]
-    fn spots_an_opening_level_one_heading() {
-        assert!(leads_with_h1("# Changelog\n\nText"));
-        assert!(leads_with_h1("\n\n  # Indented\n"));
-        assert!(leads_with_h1("Title\n=====\n\nBody"));
-        assert!(!leads_with_h1("## Section\n"));
-        assert!(!leads_with_h1("#hashtag\n"));
-        assert!(!leads_with_h1("Just a paragraph.\n"));
-        assert!(!leads_with_h1("```markdown\n# Source\n```"));
-        assert!(!leads_with_h1(""));
     }
 }
