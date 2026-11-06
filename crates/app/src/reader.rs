@@ -15,6 +15,7 @@ use crate::{
     preferences::{Preferences, SavedPane, SavedTab, SavedWorkspace},
     sidebar::{self, Item, Sort},
     tabs::{Tab, TabSet},
+    updates,
     workspace::{Workspace, home_for, name_of, now_millis},
 };
 use gpui_kit::{
@@ -69,6 +70,32 @@ pub enum Target {
     NewTab,
     /// The other pane of the active tab, splitting it first if needed.
     Split,
+}
+
+/// What the command palette is showing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Picker {
+    /// Quick Open: file names in the active workspace.
+    Files,
+    /// The focused document's headings.
+    Headings,
+    /// Search in Files: lines containing the query in every scanned workspace.
+    Text,
+}
+
+/// Most results Search in Files lists.
+const SEARCH_LIMIT: usize = 500;
+
+/// Search in Files state, kept between openings so the last results come back.
+#[derive(Default)]
+struct Search {
+    query: String,
+    hits: Vec<(PathBuf, markdown_core::TextHit)>,
+    running: bool,
+    capped: bool,
+    /// Bumped per query; a running scan stops once it no longer matches.
+    generation: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    _task: Option<Task<()>>,
 }
 
 /// Where a drag over the panes would land.
@@ -194,7 +221,8 @@ pub struct Reader {
     /// The focused document `active` last followed, so a pane finishing a
     /// load doesn't undo switching workspaces.
     followed: Option<PathBuf>,
-    picker: Option<bool>, // false: files, true: headings
+    picker: Option<Picker>,
+    search: Search,
     cursor: Option<Cursor>,
     tree_scroll: UniformListScrollHandle,
     split_state: Entity<ResizableState>,
@@ -212,6 +240,13 @@ pub struct Reader {
     info_open: bool,
     /// Nib, alive only while that panel is open.
     nib: Option<Entity<Nib>>,
+    /// The latest update check, shown in the status bar.
+    update: updates::State,
+    _update_check: Option<Task<()>>,
+    _update_timer: Option<Task<()>>,
+    _update_message: Option<Task<()>>,
+    /// "What's new" highlights for the sidebar card, until dismissed.
+    whats_new: Option<Vec<String>>,
 }
 
 impl Reader {
@@ -252,6 +287,7 @@ impl Reader {
             tabs,
             followed: None,
             picker: None,
+            search: Search::default(),
             cursor: None,
             tree_scroll: UniformListScrollHandle::new(),
             split_state: cx.new(|_| ResizableState::default()),
@@ -264,8 +300,28 @@ impl Reader {
             appearance_open: false,
             info_open: false,
             nib: None,
+            update: updates::State::Idle,
+            _update_check: None,
+            _update_timer: None,
+            _update_message: None,
+            whats_new: None,
             prefs,
         };
+        this.whats_new_on_launch();
+        crate::actions::set_menus(this.prefs.check_updates, cx);
+        this._update_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(updates::FIRST_CHECK).await;
+            loop {
+                let Ok(()) = this.update(cx, |v, cx| {
+                    if v.prefs.check_updates && updates::automatic_allowed() {
+                        v.check_updates(false, cx);
+                    }
+                }) else {
+                    return;
+                };
+                cx.background_executor().timer(updates::INTERVAL).await;
+            }
+        }));
         let saved = std::mem::take(&mut this.prefs.workspaces);
         for ws in &saved {
             if ws.root.as_ref().is_some_and(|r| !r.is_dir())
@@ -964,7 +1020,7 @@ impl Reader {
         self.tabs.insert_after_active(Tab::new(pane));
         self.after_tab_change(window, cx);
         if self.ws().root.is_some() {
-            self.open_picker(false, window, cx);
+            self.open_picker(Picker::Files, window, cx);
         }
     }
 
@@ -1062,6 +1118,11 @@ impl Reader {
                     ws.indexing = false;
                     ws.scanned = true;
                     ws.rebuild_rows();
+                    // An open Search in Files sees the new file list.
+                    if this.picker == Some(Picker::Text) {
+                        let query = this.search.query.clone();
+                        this.run_search(&query, true, cx);
+                    }
                     cx.notify();
                 }
             });
@@ -1210,6 +1271,175 @@ impl Reader {
         self.prefs.save();
     }
 
+    // MARK: Updates and "What's new"
+
+    /// After an update, show this version's highlights once. A first
+    /// launch has nothing "new" and only records the version.
+    fn whats_new_on_launch(&mut self) {
+        let version = env!("CARGO_PKG_VERSION");
+        if self.prefs.last_seen_version.as_deref() == Some(version) {
+            return;
+        }
+        if !self.prefs.first_launch
+            && let Some(notes) = updates::notes()
+        {
+            let highlights = markdown_core::highlights(&notes, 3);
+            self.whats_new = (!highlights.is_empty()).then_some(highlights);
+        }
+        self.prefs.last_seen_version = Some(version.to_owned());
+        self.prefs.save();
+    }
+
+    fn show_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.whats_new = None;
+        self.with_pane(cx, |p, cx| p.show_notes(updates::notes_page(), cx));
+        self.focus_reader(window, cx);
+        cx.notify();
+    }
+
+    fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if matches!(self.update, updates::State::Checking { .. }) {
+            if manual {
+                self.update = updates::State::Checking { manual };
+                cx.notify();
+            }
+            return;
+        }
+        self.update = updates::State::Checking { manual };
+        let fetch = cx.background_executor().spawn(async { updates::fetch() });
+        self._update_check = Some(cx.spawn(async move |this, cx| {
+            let result = fetch.await;
+            let _ = this.update(cx, |v, cx| {
+                let manual = matches!(v.update, updates::State::Checking { manual: true });
+                v.update = updates::outcome(result, manual);
+                v.clear_update_message(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// "Up to date" and "couldn't check" fade from the status bar.
+    fn clear_update_message(&mut self, cx: &mut Context<Self>) {
+        if !matches!(
+            self.update,
+            updates::State::UpToDate | updates::State::Failed
+        ) {
+            return;
+        }
+        self._update_message = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(updates::MESSAGE_FOR).await;
+            let _ = this.update(cx, |v, cx| {
+                if matches!(v.update, updates::State::UpToDate | updates::State::Failed) {
+                    v.update = updates::State::Idle;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn toggle_auto_updates(&mut self, cx: &mut Context<Self>) {
+        self.prefs.check_updates = !self.prefs.check_updates;
+        crate::actions::set_menus(self.prefs.check_updates, cx);
+        self.save(cx);
+        cx.notify();
+    }
+
+    /// The status bar's update message or button, if any.
+    fn update_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, fg) = Self::status_colors(cx);
+        let text = |s: String| div().child(s).into_any_element();
+        match &self.update {
+            updates::State::Idle | updates::State::Checking { manual: false } => None,
+            updates::State::Checking { manual: true } => Some(text("Checking for updates…".into())),
+            updates::State::UpToDate => Some(text(format!(
+                "Markdown Viewer {} is up to date",
+                env!("CARGO_PKG_VERSION")
+            ))),
+            updates::State::Failed => Some(text("Couldn't check for updates".into())),
+            updates::State::Available { version, url } => {
+                let url = url.clone();
+                Some(
+                    Button::new("update-available")
+                        .custom(
+                            ButtonCustomVariant::new(cx)
+                                .foreground(fg)
+                                .color(fg.opacity(0.14))
+                                .hover(fg.opacity(0.22))
+                                .active(fg.opacity(0.28)),
+                        )
+                        .xsmall()
+                        .icon(IconName::ArrowUp)
+                        .label(format!("Update available: {version}"))
+                        .tooltip("Open the release page to download it")
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element(),
+                )
+            }
+        }
+    }
+
+    /// The sidebar's one-time "What's new" card.
+    fn whats_new_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let highlights = self.whats_new.clone()?;
+        let theme = cx.theme();
+        Some(
+            div()
+                .mx_2()
+                .mb_2()
+                .p_3()
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.sidebar_border)
+                .bg(theme.background)
+                .text_xs()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!("What's new in {}", env!("CARGO_PKG_VERSION"))),
+                        )
+                        .child(
+                            Button::new("whats-new-dismiss")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Dismiss")
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    v.whats_new = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .children(highlights.into_iter().map(|h| {
+                    div()
+                        .flex()
+                        .gap_1p5()
+                        .text_color(theme.muted_foreground)
+                        .child("•")
+                        .child(div().min_w_0().child(h))
+                }))
+                .child(
+                    div().pt_1().child(
+                        Button::new("whats-new-read")
+                            .small()
+                            .label("Read the notes")
+                            .on_click(cx.listener(|v, _, w, cx| v.show_whats_new(w, cx))),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
     // MARK: Tree, focus, overlays
 
     fn focus_reader(&self, window: &mut Window, cx: &mut App) {
@@ -1231,25 +1461,162 @@ impl Reader {
         cx.notify();
     }
 
-    fn open_picker(&mut self, outline: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.picker = Some(outline);
+    fn open_picker(&mut self, kind: Picker, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker = Some(kind);
+        // Search in Files reopens on its last query and results.
+        let query = if kind == Picker::Text {
+            self.search.query.clone()
+        } else {
+            String::new()
+        };
         self.palette.update(cx, |s, cx| {
-            s.set_query("", window, cx);
+            s.set_query(query, window, cx);
             s.focus(window, cx);
         });
+        cx.notify();
+    }
+
+    /// Every Markdown file Search in Files reads: the scanned workspaces'
+    /// files, then loose open files, each once.
+    fn searchable_files(&self) -> Vec<PathBuf> {
+        let mut seen = HashSet::new();
+        self.order()
+            .into_iter()
+            .flat_map(|ix| {
+                let ws = &self.workspaces[ix];
+                let loose = ws
+                    .root
+                    .is_none()
+                    .then(|| ws.rows.iter().map(|r| r.path.clone()));
+                ws.files.iter().cloned().chain(loose.into_iter().flatten())
+            })
+            .filter(|p| markdown_core::is_markdown(p) && seen.insert(p.clone()))
+            .collect()
+    }
+
+    /// Search file contents off the main thread. A newer query stops an
+    /// older scan; results arrive all at once, in sidebar order.
+    fn run_search(&mut self, query: &str, force: bool, cx: &mut Context<Self>) {
+        use std::sync::atomic::Ordering;
+        let query = query.trim().to_owned();
+        if !force && query == self.search.query && self.search.running {
+            return;
+        }
+        self.search.query = query.clone();
+        let generation = self.search.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if query.is_empty() {
+            self.search.hits.clear();
+            self.search.running = false;
+            self.search.capped = false;
+            self.search._task = None;
+            cx.notify();
+            return;
+        }
+        self.search.running = true;
+        let files = self.searchable_files();
+        let current = self.search.generation.clone();
+        let scan = cx.background_executor().spawn(async move {
+            let mut hits = Vec::new();
+            for path in files {
+                if current.load(Ordering::SeqCst) != generation {
+                    return None;
+                }
+                let room = SEARCH_LIMIT + 1 - hits.len();
+                hits.extend(
+                    markdown_core::search_file(&path, &query, room)
+                        .into_iter()
+                        .map(|hit| (path.clone(), hit)),
+                );
+                if hits.len() > SEARCH_LIMIT {
+                    break;
+                }
+            }
+            Some(hits)
+        });
+        self.search._task = Some(cx.spawn(async move |this, cx| {
+            // Let fast typing settle before reading files.
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let Some(mut hits) = scan.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                if this.search.generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                this.search.capped = hits.len() > SEARCH_LIMIT;
+                hits.truncate(SEARCH_LIMIT);
+                this.search.hits = hits;
+                this.search.running = false;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// How Search in Files names each result's file: its path inside its
+    /// workspace, led by the workspace's name when several folders are open.
+    fn search_names(&self) -> HashMap<PathBuf, String> {
+        let folders = self.workspaces.iter().filter(|w| w.root.is_some()).count();
+        let mut names = HashMap::new();
+        for (path, _) in &self.search.hits {
+            if names.contains_key(path) {
+                continue;
+            }
+            let home = self.home_of(path).map(|ix| &self.workspaces[ix]);
+            let name = match home.and_then(|w| Some((w, path.strip_prefix(w.root.as_ref()?).ok()?)))
+            {
+                Some((w, rel)) if folders > 1 => format!("{} / {}", w.name(), rel.display()),
+                Some((_, rel)) => rel.display().to_string(),
+                None => path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            names.insert(path.clone(), name);
+        }
+        names
+    }
+
+    /// Open a Search in Files result and highlight that match.
+    fn open_hit(
+        &mut self,
+        index: usize,
+        target: Target,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, hit)) = self.search.hits.get(index).cloned() else {
+            return;
+        };
+        // The palette closes itself after confirming; closing it here too
+        // would make that close dismiss the find bar opened below.
+        self.open_in(path, target, window, cx);
+        let query = self.search.query.clone();
+        self.focused_pane().update(cx, |p, cx| {
+            p.find_hit(&query, hit.range.clone(), window, cx)
+        });
+        self.focus_reader(window, cx);
         cx.notify();
     }
 
     /// ⌘↵ / ⌥↵: open the highlighted Quick Open result or tree row elsewhere.
     fn open_selection(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         let path = match self.picker {
-            Some(false) => {
+            Some(Picker::Text) => {
+                let row = self.palette.read(cx).selected_index().map(|ix| ix.row);
+                self.close_overlay(window, cx);
+                if let Some(row) = row {
+                    self.open_hit(row, target, window, cx);
+                }
+                return;
+            }
+            Some(Picker::Files) => {
                 let row = self.palette.read(cx).selected_index().map(|ix| ix.row);
                 let path = row.and_then(|r| self.ws().files.get(r).cloned());
                 self.close_overlay(window, cx);
                 path
             }
-            Some(true) => return,
+            Some(Picker::Headings) => return,
             None => {
                 let items = self.layout();
                 let hit = self
@@ -1746,14 +2113,18 @@ impl Reader {
                             .icon(IconName::Search)
                             .label("Quick Open")
                             .tooltip("Find a file · ⌘P or ⌘K")
-                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(false, w, cx))),
+                            .on_click(
+                                cx.listener(|v, _, w, cx| v.open_picker(Picker::Files, w, cx)),
+                            ),
                     )
                     .child(
                         Button::new("outline")
                             .ghost()
                             .label("Outline")
                             .tooltip("Heading outline · ⇧⌘L")
-                            .on_click(cx.listener(|v, _, w, cx| v.open_picker(true, w, cx))),
+                            .on_click(
+                                cx.listener(|v, _, w, cx| v.open_picker(Picker::Headings, w, cx)),
+                            ),
                     )
                     .child(
                         Button::new("split")
@@ -2250,6 +2621,7 @@ impl Reader {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let card = self.whats_new_card(cx);
         let ws = self.ws();
         let items = Rc::new(self.layout());
         let mut positions = vec![0; self.workspaces.len()];
@@ -2334,6 +2706,7 @@ impl Reader {
                     .flex_1(),
                 )
             })
+            .children(card)
             .child(
                 div()
                     .px_4()
@@ -2996,6 +3369,7 @@ impl Reader {
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let update = self.update_status(cx);
         let pane = self.focused_pane();
         let pane = pane.read(cx);
         let (status_bg, status_fg) = Self::status_colors(cx);
@@ -3011,11 +3385,18 @@ impl Reader {
             .bg(status_bg)
             .text_xs()
             .text_color(status_fg)
-            .child(if pane.source {
-                "SOURCE · READ ONLY"
-            } else {
-                "MARKDOWN · READ ONLY"
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(if pane.source {
+                        "SOURCE · READ ONLY"
+                    } else {
+                        "MARKDOWN · READ ONLY"
+                    })
+                    .children(update),
+            )
             .child(
                 div()
                     .flex()
@@ -3104,10 +3485,12 @@ impl Reader {
     }
 
     fn picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let outline = self.picker == Some(true);
+        let kind = self.picker.unwrap_or(Picker::Files);
+        let outline = kind == Picker::Headings;
         let ws = self.ws();
-        let items: Vec<CommandItem> = if outline {
-            self.focused_pane()
+        let items: Vec<CommandItem> = match kind {
+            Picker::Headings => self
+                .focused_pane()
                 .read(cx)
                 .document
                 .as_ref()
@@ -3127,9 +3510,9 @@ impl Reader {
                         })
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            ws.files
+                .unwrap_or_default(),
+            Picker::Files => ws
+                .files
                 .iter()
                 .map(|path| {
                     CommandItem::new()
@@ -3141,14 +3524,52 @@ impl Reader {
                         )
                         .action(Box::new(OpenPath { path: path.clone() }))
                 })
-                .collect()
+                .collect(),
+            Picker::Text => {
+                let names = self.search_names();
+                self.search
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (path, hit))| {
+                        let hit = hit.clone();
+                        let name = names.get(path).cloned().unwrap_or_default();
+                        CommandItem::new()
+                            .label(hit.snippet.clone())
+                            .action(Box::new(OpenSearchHit { index }))
+                            .child(move |_, cx| info::search_row(&name, &hit, cx))
+                    })
+                    .collect()
+            }
         };
-        let empty_msg = if outline {
-            "No headings in this document."
-        } else if ws.root.is_none() {
-            "Add a folder (⇧⌘O) to search its Markdown files."
-        } else {
-            "No matching files."
+        let empty_msg: SharedString = match kind {
+            Picker::Headings => "No headings in this document.".into(),
+            Picker::Files if ws.root.is_none() => {
+                "Add a folder (⇧⌘O) to search its Markdown files.".into()
+            }
+            Picker::Files => "No matching files.".into(),
+            Picker::Text if self.search.query.is_empty() => {
+                "Type to search the text of every Markdown file in your open folders.".into()
+            }
+            Picker::Text if self.search.running => "Searching…".into(),
+            Picker::Text => format!("No matches for “{}”.", self.search.query).into(),
+        };
+        let (placeholder, group) = match kind {
+            Picker::Files => ("Find a Markdown file…", "FILES".to_owned()),
+            Picker::Headings => ("Jump to heading…", "HEADINGS".to_owned()),
+            Picker::Text => (
+                "Search in files…",
+                match (
+                    self.search.hits.len(),
+                    self.search.capped,
+                    self.search.running,
+                ) {
+                    (_, _, true) if self.search.hits.is_empty() => "MATCHES".to_owned(),
+                    (n, true, _) => format!("FIRST {n} MATCHES"),
+                    (1, _, _) => "1 MATCH".to_owned(),
+                    (n, _, _) => format!("{n} MATCHES"),
+                },
+            ),
         };
         let weak = cx.entity().downgrade();
         let cancel = weak.clone();
@@ -3174,10 +3595,14 @@ impl Reader {
                     .shadow_lg()
                     .child(
                         Command::new(&self.palette)
-                            .placeholder(if outline {
-                                "Jump to heading…"
-                            } else {
-                                "Find a Markdown file…"
+                            .placeholder(placeholder)
+                            .filterable(kind != Picker::Text)
+                            .when(kind == Picker::Text, |c| {
+                                let search = cx.entity().downgrade();
+                                c.on_query(move |query, _, cx| {
+                                    let _ =
+                                        search.update(cx, |v, cx| v.run_search(query, false, cx));
+                                })
                             })
                             .bordered(true)
                             .max_h(px(380.))
@@ -3187,13 +3612,9 @@ impl Reader {
                                     .text_center()
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(empty_msg)
+                                    .child(empty_msg.clone())
                             })
-                            .group(
-                                CommandGroup::new()
-                                    .label(if outline { "HEADINGS" } else { "FILES" })
-                                    .items(items),
-                            )
+                            .group(CommandGroup::new().label(group).items(items))
                             .on_confirm(move |_, w, cx| {
                                 let _ = weak.update(cx, |v, cx| v.close_overlay(w, cx));
                             })
@@ -3292,7 +3713,13 @@ impl Reader {
                 }),
                 "source" => self.with_pane(cx, |p, cx| p.toggle_source(cx)),
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
-                "quick-open" => self.open_picker(false, window, cx),
+                "quick-open" => self.open_picker(Picker::Files, window, cx),
+                "search" => {
+                    self.open_picker(Picker::Text, window, cx);
+                    self.palette
+                        .update(cx, |s, cx| s.set_query(arg.replace('~', " "), window, cx));
+                    self.run_search(&arg.replace('~', " "), true, cx);
+                }
                 "appearance" => self.appearance_open = true,
                 "info" => self.set_info_open(true, cx),
                 "nib" => {
@@ -3300,7 +3727,24 @@ impl Reader {
                         nib.update(cx, |n, _| n.pose(arg));
                     }
                 }
-                "outline" => self.open_picker(true, window, cx),
+                "outline" => self.open_picker(Picker::Headings, window, cx),
+                "open-hit" => {
+                    self.picker = None;
+                    self.open_hit(arg.parse().unwrap_or(0), Target::Keep, window, cx)
+                }
+                "whats-new" => {
+                    let notes = updates::notes().unwrap_or_else(|| {
+                        "- **Math.** Inline and block LaTeX.\n- **Search in Files.** ⇧⌘F.".into()
+                    });
+                    self.whats_new = Some(markdown_core::highlights(&notes, 3));
+                }
+                "notes" => self.show_whats_new(window, cx),
+                "update" => {
+                    self.update = updates::State::Available {
+                        version: arg.to_owned(),
+                        url: updates::RELEASES.to_owned(),
+                    }
+                }
                 "find" => {
                     let pane = self.focused_pane();
                     pane.update(cx, |p, cx| p.set_find_query(arg, window, cx));
@@ -3338,8 +3782,17 @@ impl Render for Reader {
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &FocusReader, w, cx| v.focus_reader(w, cx)))
-            .on_action(cx.listener(|v, _: &QuickOpen, w, cx| v.open_picker(false, w, cx)))
-            .on_action(cx.listener(|v, _: &Outline, w, cx| v.open_picker(true, w, cx)))
+            .on_action(cx.listener(|v, _: &QuickOpen, w, cx| v.open_picker(Picker::Files, w, cx)))
+            .on_action(cx.listener(|v, _: &Outline, w, cx| v.open_picker(Picker::Headings, w, cx)))
+            .on_action(
+                cx.listener(|v, _: &SearchInFiles, w, cx| v.open_picker(Picker::Text, w, cx)),
+            )
+            .on_action(cx.listener(|v, _: &CheckForUpdates, _, cx| v.check_updates(true, cx)))
+            .on_action(cx.listener(|v, _: &ToggleAutoUpdates, _, cx| v.toggle_auto_updates(cx)))
+            .on_action(cx.listener(|v, _: &ShowWhatsNew, w, cx| v.show_whats_new(w, cx)))
+            .on_action(
+                cx.listener(|v, a: &OpenSearchHit, w, cx| v.open_hit(a.index, Target::Keep, w, cx)),
+            )
             .on_action(cx.listener(|v, a: &OpenPath, w, cx| {
                 v.picker = None;
                 v.open_in(a.path.clone(), Target::Keep, w, cx);
@@ -3699,6 +4152,57 @@ mod tests {
         interact(w, cx, |w, cx| w.press("enter", cx));
         assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(second));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn search_in_files_lists_lines_and_opens_on_the_match(cx: &mut TestAppContext) {
+        let tmp = folder(&[
+            ("Alpha.md", "# Alpha\n\nNo fruit.\n"),
+            (
+                "Beta.md",
+                "---\ntitle: x\n---\n# Beta\n\nOne apple.\n\n## Later\n\nTwo **apples** here.\n",
+            ),
+        ]);
+        let beta = tmp.path().join("Beta.md");
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(tmp.path().into(), w, cx)
+        });
+        interact(w, cx, |w, cx| {
+            w.press("cmd-shift-f", cx);
+            w.render_frame(cx);
+            w.input("APPLE", cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        let hits = view.read_with(cx, |v, _| {
+            v.search
+                .hits
+                .iter()
+                .map(|(p, h)| (p.clone(), h.line, h.heading.clone()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            hits,
+            [
+                (beta.clone(), 6, Some("Beta".to_owned())),
+                (beta.clone(), 10, Some("Later".to_owned())),
+            ]
+        );
+        // The second hit opens Beta with find on its match, not the first.
+        interact(w, cx, |w, cx| {
+            w.press("down", cx);
+            w.press("enter", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(beta));
+        assert!(view.read_with(cx, |v, _| v.picker.is_none()));
+        let (find, matches, index) = pane(&view, cx, |p| (p.find, p.matches.len(), p.match_index));
+        assert!(find);
+        assert_eq!((matches, index), (2, 1));
+        // Reopening keeps the last query and results.
+        interact(w, cx, |w, cx| w.press("cmd-shift-f", cx));
+        assert_eq!(view.read_with(cx, |v, _| v.search.hits.len()), 2);
     }
 
     #[gpui_kit::test]
@@ -4173,7 +4677,7 @@ mod tests {
     fn cmd_k_opens_quick_open_and_escape_closes(cx: &mut TestAppContext) {
         let (w, view) = open(cx);
         interact(w, cx, |w, cx| w.press("cmd-k", cx));
-        assert_eq!(view.read_with(cx, |v, _| v.picker), Some(false));
+        assert_eq!(view.read_with(cx, |v, _| v.picker), Some(Picker::Files));
         interact(w, cx, |w, cx| w.press("escape", cx));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
     }
