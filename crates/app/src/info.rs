@@ -393,6 +393,42 @@ pub fn panel(
     panel.into_any_element()
 }
 
+/// One "Search in Files" result: the matching line with the match
+/// highlighted, then where it is.
+pub fn search_row(file: &str, hit: &markdown_core::TextHit, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let highlight = HighlightStyle {
+        font_weight: Some(FontWeight::SEMIBOLD),
+        background_color: Some(theme.primary.opacity(0.18)),
+        ..Default::default()
+    };
+    let place = match &hit.heading {
+        Some(heading) => format!("{file}  ·  {heading}  ·  line {}", hit.line),
+        None => format!("{file}  ·  line {}", hit.line),
+    };
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .py(px(2.))
+        .child(
+            div().min_w_0().truncate().child(
+                StyledText::new(hit.snippet.clone())
+                    .with_highlights([(hit.snippet_match.clone(), highlight)]),
+            ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(place),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Stats, compact, mood, thousands};

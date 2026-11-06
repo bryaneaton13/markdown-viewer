@@ -9,6 +9,10 @@ actions!(
         FocusSidebar,
         FocusReader,
         QuickOpen,
+        SearchInFiles,
+        CheckForUpdates,
+        ToggleAutoUpdates,
+        ShowWhatsNew,
         Outline,
         Find,
         NextMatch,
@@ -59,6 +63,11 @@ pub struct SwitchWorkspace {
 }
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = markdown_viewer, no_json)]
+pub struct OpenSearchHit {
+    pub index: usize,
+}
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = markdown_viewer, no_json)]
 pub struct JumpHeading {
     pub index: usize,
 }
@@ -74,6 +83,7 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-2", FocusReader, None),
         KeyBinding::new("cmd-p", QuickOpen, None),
         KeyBinding::new("cmd-k", QuickOpen, None),
+        KeyBinding::new("cmd-shift-f", SearchInFiles, None),
         KeyBinding::new("cmd-shift-l", Outline, None),
         KeyBinding::new("cmd-f", Find, None),
         KeyBinding::new("cmd-g", NextMatch, None),
@@ -126,8 +136,19 @@ pub fn bind(cx: &mut App) {
         .enumerate()
         .map(|(index, key)| KeyBinding::new(key, SwitchWorkspace { index }, None)),
     );
+    set_menus(true, cx);
+}
+
+/// The menu bar. Rebuilt when "Check for Updates Automatically" changes,
+/// since the check mark is part of the item.
+pub fn set_menus(auto_updates: bool, cx: &mut App) {
     cx.set_menus([
         Menu::new("Markdown Viewer").items([
+            MenuItem::action("What's New", ShowWhatsNew),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::action("Check for Updates Automatically", ToggleAutoUpdates)
+                .checked(auto_updates),
+            MenuItem::separator(),
             MenuItem::action("Keyboard Shortcuts & Setup", Help),
             MenuItem::separator(),
             MenuItem::action("Quit Markdown Viewer", Quit),
@@ -149,6 +170,7 @@ pub fn bind(cx: &mut App) {
             MenuItem::action("Copy", gpui_kit::base::input::Copy),
             MenuItem::action("Select All", gpui_kit::base::input::SelectAll),
             MenuItem::action("Find…", Find),
+            MenuItem::action("Search in Files…", SearchInFiles),
             MenuItem::action("Next Match", NextMatch),
             MenuItem::action("Previous Match", PrevMatch),
         ]),

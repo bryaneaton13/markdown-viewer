@@ -6,6 +6,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod release_notes;
+mod search;
+pub use release_notes::{highlights, is_newer, release_notes};
+pub use search::{TextHit, frontmatter_end, search_body, search_file};
+
 pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
