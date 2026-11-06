@@ -609,7 +609,7 @@ impl Render for DocPane {
                     .line_height(relative(1.65))
                     // The list only hears the wheel over its own rows, so the
                     // gutters and the space above pass theirs along.
-                    .on_scroll_wheel({
+                    .on_scroll({
                         let text = self.text.clone();
                         move |event, window, cx| {
                             if list.viewport_bounds().contains(&event.position) {

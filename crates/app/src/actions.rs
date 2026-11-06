@@ -117,13 +117,15 @@ pub fn bind(cx: &mut App) {
         KeyBinding::new("cmd-enter", OpenInNewTab, Some("MarkdownTree")),
         KeyBinding::new("alt-enter", OpenInSplit, Some("MarkdownTree")),
     ]);
-    cx.bind_keys((0..9).map(|index| {
-        KeyBinding::new(
-            &format!("ctrl-{}", index + 1),
-            SwitchWorkspace { index },
-            None,
-        )
-    }));
+    cx.bind_keys(
+        [
+            "ctrl-1", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5", "ctrl-6", "ctrl-7", "ctrl-8",
+            "ctrl-9",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, key)| KeyBinding::new(key, SwitchWorkspace { index }, None)),
+    );
     cx.set_menus([
         Menu::new("Markdown Viewer").items([
             MenuItem::action("Keyboard Shortcuts & Setup", Help),

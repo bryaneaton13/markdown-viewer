@@ -3249,8 +3249,9 @@ impl Reader {
                 "dark" => self.set_appearance(Some(true), window, cx),
                 "light" => self.set_appearance(Some(false), window, cx),
                 "palette" => {
-                    if let Some(p) = Palette::ALL
+                    if let Some(p) = Palette::EDITOR
                         .into_iter()
+                        .chain(Palette::FUN)
                         .find(|p| p.label().eq_ignore_ascii_case(arg))
                     {
                         self.set_palette(p, window, cx);
