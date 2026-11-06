@@ -3,6 +3,9 @@ members = ["crates/markdown-core", "crates/app"]
 default-members = ["crates/app"]
 resolver = "2"
 
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }
+
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
