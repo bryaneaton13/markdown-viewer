@@ -20,8 +20,16 @@ use markdown_core::{Document, Link, Stats};
 use std::{ops::Range, path::PathBuf};
 
 const LOGO: &[u8] = include_bytes!("../../../assets/logo.png");
-pub const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Add a folder as a workspace\n- **⌘P** — Jump to a file (**⌘↵** opens it in a new tab, **⌥↵** beside this one)\n- **⌘T** — New tab · **⌘\\\\** — Split side by side\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
-pub const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / add folder workspace |\n| ⌘P / ⌘K | Quick Open (⌘↵ new tab, ⌥↵ split) |\n| ⌘T / ⌘W / ⇧⌘T | New tab / close pane or tab / reopen closed |\n| ⌃Tab / ⌃⇧Tab, ⇧⌘] / ⇧⌘[ | Next / previous tab |\n| ⌘\\\\ | Split side by side / unsplit |\n| ⌥⌘← / ⌥⌘→ | Focus left / right pane |\n| ⌃1 … ⌃9 | Switch workspace (in sidebar order) |\n| Click / double-click in tree | Preview (italic tab, reused) / keep open |\n| ⌘-click / ⌥-click in tree | Open in new tab / in the other pane |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree; ← / → close / open folders |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark (palette button: system & themes) |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| ⇧⌘W | Close window |\n| Escape | Dismiss picker, find, or help |\n\nA single click in the sidebar previews a file in a reused tab with an italic title; double-click the file or its tab to keep it open. In the sidebar, click a workspace to open or close it without switching; drag workspaces to reorder them. Drag a tab onto the left or right half of the page to read it side by side. Drag a pane's header back to the tab bar to give it its own tab.\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels per workspace. A tab shows one document, or two side by side. Mermaid stays visible as code. Remote images are not fetched.\n";
+pub const WELCOME: &str = "# A little room to read.\n\nOpen a Markdown file or a folder. Your files stay exactly as they are.\n\n### Start here\n\n- **⌘O** — Open a Markdown file\n- **⇧⌘O** — Add a folder as a workspace\n- **⌘P** — Jump to a file (**⌘↵** opens it in a new tab, **⌥↵** beside this one)\n- **⇧⌘F** — Search the text of every file in your folders\n- **⌘T** — New tab · **⌘\\\\** — Split side by side\n- **⌘B** — Hide the sidebar and settle in\n\nTables, code, links, local images, LaTeX math, and YAML frontmatter are supported. No accounts. No editing. Just your documents.\n\n> Tip: press **⌘/** for keyboard shortcuts and Finder setup.\n";
+pub const HELP: &str = "# Keyboard shortcuts & Finder setup\n\n| Shortcut | Action |\n|---|---|\n| ⌘O / ⇧⌘O | Open Markdown / add folder workspace |\n| ⌘P / ⌘K | Quick Open (⌘↵ new tab, ⌥↵ split) |\n| ⇧⌘F | Search in Files (↵ opens at the match) |\n| ⌘T / ⌘W / ⇧⌘T | New tab / close pane or tab / reopen closed |\n| ⌃Tab / ⌃⇧Tab, ⇧⌘] / ⇧⌘[ | Next / previous tab |\n| ⌘\\\\ | Split side by side / unsplit |\n| ⌥⌘← / ⌥⌘→ | Focus left / right pane |\n| ⌃1 … ⌃9 | Switch workspace (in sidebar order) |\n| Click / double-click in tree | Preview (italic tab, reused) / keep open |\n| ⌘-click / ⌥-click in tree | Open in new tab / in the other pane |\n| ⌘B | Hide / show sidebar |\n| ⌘1 / ⌘2 | Focus tree / reader |\n| ↑ ↓ ← → | Navigate focused tree; ← / → close / open folders |\n| Space / Enter in tree | Focus reader / open selection |\n| ⌘F / ⌘G / ⇧⌘G | Find / next / previous |\n| ⌘[ / ⌘] | Back / forward |\n| ⇧⌘M | Read-only source / preview |\n| ⇧⌘I | Properties |\n| ⇧⌘L | Heading outline |\n| ⇧⌘D | Light / dark (palette button: system & themes) |\n| ⌘+ / ⌘− / ⌘0 | Text size |\n| ⌘R | Reload |\n| ⇧⌘W | Close window |\n| Escape | Dismiss picker, find, or help |\n\nA single click in the sidebar previews a file in a reused tab with an italic title; double-click the file or its tab to keep it open. In the sidebar, click a workspace to open or close it without switching; drag workspaces to reorder them. Drag a tab onto the left or right half of the page to read it side by side. Drag a pane's header back to the tab bar to give it its own tab.\n\n## Default Markdown viewer\n\nInstall **Markdown Viewer.app** in Applications. In Finder, select a `.md` file → **Get Info** → **Open with** → **Markdown Viewer** → **Change All**. Repeat for `.markdown` if necessary.\n\n## Finder Quick Look\n\nThe app bundle includes **Markdown Preview.appex**. Enable it under System Settings → General → Login Items & Extensions → Quick Look if required by your macOS version. Select a Markdown file in Finder and press **Space**.\n\nThe extension renders text, lists, code, tables and properties offline. Adjacent images are represented by their alt text in Finder because the extension only receives access to the selected document.\n\n## Scope\n\nOnly `.md` and `.markdown` files, UTF-8, up to 8 MiB. Folder search respects ignore files and hides hidden entries; capped at 20,000 Markdown paths / 32 levels per workspace. A tab shows one document, or two side by side. Math between `$…$`, `$$…$$` or in a ```` ```math ```` block is typeset; anything it can't typeset stays as written. Mermaid stays visible as code. Remote images are not fetched.\n\n## Updates and logs\n\nMarkdown Viewer asks GitHub for the latest release now and then and shows a button in the status bar when there is a newer one. It only reads the version; nothing is downloaded or sent. Turn it off with **Markdown Viewer → Check for Updates Automatically**. A log of each launch is kept in `~/Library/Logs/Markdown Viewer`.\n";
+
+/// A built-in page shown in place of the document while `help` is on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Page {
+    Help,
+    /// "What's new": release notes, as Markdown.
+    Notes(String),
+}
 
 /// Shared reading size, set by the window from preferences.
 pub struct FontSize(pub f32);
@@ -43,13 +51,18 @@ pub struct DocPane {
     pub stats: Option<Stats>,
     pub source: bool,
     pub properties: bool,
+    /// Showing `page` instead of the document.
     pub help: bool,
+    pub page: Page,
     pub copied: bool,
     pub find: bool,
     pub matches: Vec<Range<usize>>,
     pub match_index: usize,
     searched: Option<RenderedText>,
     pending_anchor: Option<String>,
+    /// A Search in Files match (a byte range in the body) to select once the
+    /// document has rendered.
+    pending_hit: Option<Range<usize>>,
     history: Vec<PathBuf>,
     history_index: usize,
     pub loading: bool,
@@ -100,12 +113,14 @@ impl DocPane {
             source: false,
             properties: false,
             help: false,
+            page: Page::Help,
             copied: false,
             find: false,
             matches: Vec::new(),
             match_index: 0,
             searched: None,
             pending_anchor: None,
+            pending_hit: None,
             history: Vec::new(),
             history_index: 0,
             loading: false,
@@ -154,7 +169,10 @@ impl DocPane {
     /// File name, or a placeholder for an empty pane.
     pub fn title(&self) -> String {
         if self.help {
-            return "Keyboard Shortcuts".into();
+            return match self.page {
+                Page::Help => "Keyboard Shortcuts".into(),
+                Page::Notes(_) => "What's New".into(),
+            };
         }
         self.path
             .as_ref()
@@ -191,6 +209,7 @@ impl DocPane {
             self.history.push(path.clone());
             self.history_index = self.history.len() - 1;
         }
+        let path_for_log = path.clone();
         let task = cx.background_executor().spawn(async move {
             markdown_core::read_document(&path).map(|doc| {
                 let stats = doc.stats();
@@ -212,6 +231,7 @@ impl DocPane {
                         this.present(cx);
                     }
                     Err(e) => {
+                        log::warn!("Could not read {}: {e}", path_for_log.display());
                         this.error = Some(e);
                         this.document = None;
                         this.stats = None;
@@ -237,7 +257,10 @@ impl DocPane {
 
     pub fn present(&mut self, cx: &mut Context<Self>) {
         let content = if self.help {
-            HELP.to_owned()
+            match &self.page {
+                Page::Help => HELP.to_owned(),
+                Page::Notes(notes) => notes.clone(),
+            }
         } else if let Some(doc) = &self.document {
             if self.source {
                 doc.source_markdown()
@@ -258,7 +281,16 @@ impl DocPane {
     }
 
     pub fn toggle_help(&mut self, cx: &mut Context<Self>) {
-        self.help = !self.help;
+        self.help = !(self.help && self.page == Page::Help);
+        self.page = Page::Help;
+        self.present(cx);
+        cx.emit(PaneEvent::Changed);
+    }
+
+    /// Show release notes in place of the document; Escape returns to it.
+    pub fn show_notes(&mut self, notes: String, cx: &mut Context<Self>) {
+        self.help = true;
+        self.page = Page::Notes(notes);
         self.present(cx);
         cx.emit(PaneEvent::Changed);
     }
@@ -286,7 +318,7 @@ impl DocPane {
         cx.notify();
     }
 
-    #[cfg(any(test, feature = "screenshot"))]
+    #[cfg(feature = "screenshot")]
     pub fn set_find_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.find = true;
         self.find_input
@@ -294,10 +326,51 @@ impl DocPane {
         self.update_find(cx);
     }
 
+    /// Show a Search in Files match: find its query, starting at that match.
+    pub fn find_hit(
+        &mut self,
+        query: &str,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source || self.help {
+            self.source = false;
+            self.help = false;
+            if self.document.is_some() {
+                self.present(cx);
+            }
+        }
+        self.find = true;
+        self.match_index = 0;
+        self.pending_hit = Some(range);
+        self.find_input
+            .update(cx, |s, cx| s.set_value(query.to_owned(), window, cx));
+        self.update_find(cx);
+    }
+
     pub fn update_find(&mut self, cx: &mut Context<Self>) {
         let query = self.find_input.read(cx).value();
         let rendered = self.text.read(cx).rendered_text();
-        self.matches = markdown_core::find_ranges(rendered.as_str(), &query);
+        if let Some(hit) = self.pending_hit.clone() {
+            // Wait until this document, not the previous one, is on screen.
+            let shown = !self.loading
+                && self
+                    .document
+                    .as_ref()
+                    .is_some_and(|d| rendered.source() == d.body);
+            if !shown {
+                return;
+            }
+            self.pending_hit = None;
+            self.matches = markdown_core::find_ranges(rendered.as_str(), &query);
+            self.match_index = rendered
+                .range_for_source(hit)
+                .and_then(|r| self.matches.iter().position(|m| m.end > r.start))
+                .unwrap_or(0);
+        } else {
+            self.matches = markdown_core::find_ranges(rendered.as_str(), &query);
+        }
         self.match_index = self.match_index.min(self.matches.len().saturating_sub(1));
         let ranges = self.matches.clone();
         let selected = self.match_index;
@@ -366,7 +439,12 @@ impl DocPane {
     }
 
     pub fn follow(&mut self, link: &str, cx: &mut Context<Self>) {
-        let Some(path) = &self.path else {
+        // Built-in pages (and the welcome page) have no file to resolve
+        // against; their web links still open.
+        let Some(path) = self.path.as_ref().filter(|_| !self.help) else {
+            if link.starts_with("https://") || link.starts_with("http://") {
+                cx.open_url(link);
+            }
             return;
         };
         match markdown_core::resolve_link(path, link) {
@@ -453,6 +531,7 @@ impl Render for DocPane {
         };
         let top = (px(lead) - scrolled).clamp(px(0.), px(lead));
         let reader = TextView::new(&self.text)
+            .markdown_extensions(crate::math::extensions())
             .scrollable(true)
             .size_full()
             // Padding, not margin: the scrollbar stays on the pane's edge.

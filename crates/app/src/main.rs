@@ -2,6 +2,8 @@ mod actions;
 mod chrome;
 mod files;
 mod info;
+mod logging;
+mod math;
 mod names;
 mod pane;
 mod pet;
@@ -9,6 +11,7 @@ mod preferences;
 mod reader;
 mod sidebar;
 mod tabs;
+mod updates;
 mod workspace;
 
 use actions::*;
@@ -74,11 +77,12 @@ fn open(path: Option<PathBuf>, cx: &mut App) {
         Ok((handle, view)) => {
             cx.set_global(MainWindow(handle.downcast::<Root>(), Some(view)));
         }
-        Err(e) => eprintln!("Could not open viewer: {e:#}"),
+        Err(e) => log::error!("Could not open viewer: {e:#}"),
     }
 }
 
 fn main() {
+    logging::init();
     let paths: Vec<_> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let app = gpui_kit::application()
         .with_assets(AppAssets)

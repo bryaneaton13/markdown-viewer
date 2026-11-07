@@ -17,7 +17,7 @@
   <img src="docs/screenshots/light.png" alt="Markdown Viewer in light mode with a folder tree and a rendered document" width="800">
 </p>
 
-Open a folder of Markdown, jump between files, and read them rendered. Nothing is editable, so you can't change a file by accident. It is built in Rust with [GPUI Kit](https://github.com/longbridge/gpui-kit), has no web view or Electron runtime, and works fully offline.
+Open a folder of Markdown, jump between files, and read them rendered. Nothing is editable, so you can't change a file by accident. It is built in Rust with [GPUI Kit](https://github.com/longbridge/gpui-kit), has no web view or Electron runtime, and works fully offline. The only network request is an optional check for a newer release (see [Updates](#updates)).
 
 > **Status: early release (v0.1).** It works and is tested, but the download is ad-hoc signed, not notarized. See [Limitations](#limitations).
 
@@ -26,6 +26,8 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 - Selectable, natively rendered Markdown: headings, emphasis, lists, tables, task lists, code, links, footnotes and local images.
 - Folder tree and filtered **Quick Open** (⌘P) for `.md` and `.markdown` files.
 - Find against the *rendered* text, with match highlighting and next/previous.
+- **Search in Files** (⇧⌘F) across every Markdown file in your open folders, opening at the match.
+- **LaTeX math**: `$…$` inline, and `$$…$$` or ```` ```math ```` blocks, typeset natively. Anything that doesn't typeset stays as written.
 - Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
 - **Workspaces** for several folders, listed together in the sidebar as folders that open and close, with **tabs** that can mix files from any of them, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
 - Editor-style **preview tabs**: a click previews a file in a reused italic tab, a double-click keeps it. Same-named files show the folder that tells them apart.
@@ -127,6 +129,12 @@ Drag a tab, or a file from the sidebar, to the left or right edge of the page to
 You can also drag Markdown files in from Finder. Drop one near the left or right edge of the page to split, or in the middle to open it in place (Back returns to the previous document). On a split, a file dropped on either pane replaces it. Drop two on an empty tab to read them side by side. Files dropped on the tab strip open as new tabs. Folders dropped on the sidebar become workspaces.
 
 The app keeps running after you close its window; quit with ⌘Q. Settings, including open workspaces and tabs, live in `~/Library/Application Support/Markdown Viewer/settings.json`.
+
+## Updates
+
+About once every 12 hours (and 10 seconds after launch) the app asks GitHub for the latest release of this repository. If it is newer, a button in the status bar opens its release page. Nothing is downloaded or installed, and no identifiers are sent. Turn it off with **Markdown Viewer → Check for Updates Automatically**, or check by hand with **Check for Updates…**. After an update, a card in the sidebar lists what changed once; **What's New** shows the notes again.
+
+Each launch writes a log to `~/Library/Logs/Markdown Viewer` (the previous launch's log is kept as `markdown-viewer.old.log`). Attach it when reporting a problem.
 
 ## Limitations
 

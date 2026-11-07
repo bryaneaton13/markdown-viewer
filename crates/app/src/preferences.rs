@@ -21,6 +21,15 @@ pub struct Preferences {
     pub active_tab: usize,
     /// How the sidebar orders folder workspaces.
     pub sidebar_sort: Sort,
+    /// Ask GitHub for a newer release now and then.
+    pub check_updates: bool,
+    /// The version whose "What's new" card was last shown. Missing in
+    /// settings written before 0.2, which therefore count as an update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_version: Option<String>,
+    /// No settings file existed: a first launch, which has nothing "new".
+    #[serde(skip)]
+    pub first_launch: bool,
     /// Pre-0.2 single folder / file. Read once and folded into `workspaces`.
     #[serde(skip_serializing)]
     pub folder: Option<PathBuf>,
@@ -97,6 +106,9 @@ impl Default for Preferences {
             tabs: Vec::new(),
             active_tab: 0,
             sidebar_sort: Sort::Manual,
+            check_updates: true,
+            last_seen_version: None,
+            first_launch: false,
             folder: None,
             file: None,
         }
@@ -116,10 +128,13 @@ impl Preferences {
         if cfg!(test) {
             return Self::default();
         }
-        let prefs: Self = std::fs::read(Self::path())
-            .ok()
-            .and_then(|s| serde_json::from_slice(&s).ok())
-            .unwrap_or_default();
+        let Ok(bytes) = std::fs::read(Self::path()) else {
+            return Self {
+                first_launch: true,
+                ..Self::default()
+            };
+        };
+        let prefs: Self = serde_json::from_slice(&bytes).unwrap_or_default();
         prefs.normalized()
     }
 
@@ -186,7 +201,7 @@ impl Preferences {
             std::fs::rename(temp, path)
         })();
         if let Err(e) = result {
-            eprintln!("Could not save viewer preferences: {e}");
+            log::warn!("Could not save viewer preferences: {e}");
         }
     }
 }
