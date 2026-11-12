@@ -5,7 +5,7 @@ Research and build-versus-use rationale: [RESEARCH.md](RESEARCH.md).
 
 ## Implementation decision
 
-The project is a custom GPUI prototype. The first implementation is read-only and Markdown-only. Finder Quick Look is promoted into this delivery; Mermaid remains code because it is not a trivial built-in Kit component. One-document navigation/history replaces tabs in the first prototype. See [README.md](../README.md) for implemented behavior and repeatable validation commands; the sections below retain the broader design roadmap.
+The project is a custom GPUI prototype. The first implementation is read-only and Markdown-only. Finder Quick Look is promoted into this delivery. Mermaid is drawn natively by a pure-Rust renderer (see below). One-document navigation/history replaces tabs in the first prototype. See [README.md](../README.md) for implemented behavior and repeatable validation commands; the sections below retain the broader design roadmap.
 
 ## 1. Product decision
 
@@ -98,13 +98,16 @@ Raw HTML receives the renderer's safe non-executing treatment; no scripts or emb
 4. Ordinary horizontal rules and fenced YAML remain body content. Do not interpret metadata as instructions, templates, or executable tags.
 5. Add TOML frontmatter only as a separately tested enhancement.
 
-### Mermaid: small optional milestone
+### Mermaid: native, pure Rust
 
-Reuse Glim's approach, not its entire multi-format diagram system. Bundle a pinned Mermaid build at packaging time. A private helper process hosts WebKit on its main thread; it receives bounded source jobs, returns sanitized SVG, and the service rasterizes it for GPUI display. No Node runtime is required after installation.
+Implemented in `crates/app/src/mermaid.rs` as a `MarkdownPlugin`, alongside math. The WebKit-helper approach planned earlier is no longer needed: pure-Rust renderers matured in 2026 (Zed and other GPUI apps ship them).
 
-Render only visible/near-visible blocks, with a bounded queue. Cache by source hash, engine version, theme, scale, and rendering options. Time out and terminate stuck jobs; show source and Retry on failure. Invalidate affected diagrams on theme or document changes. Render at Retina scale and rerender when zoom demands it; retain diagram source for accessibility and copying.
-
-Start with flowchart and sequence coverage. Keep strict mode, block external resource fetching and navigation, and limit dimensions/working memory. Preserve license notices. A diagram failure must not block reading prose or opening another file.
+- **Renderer:** [rusty-mermaid](https://github.com/base58ed/rusty-mermaid) `=0.2.0` (MIT), with the `svg` backend only. Its own GPUI backend targets crates.io `gpui` 0.2, not this app's GPUI, so diagrams go through SVG and GPUI's image path like math does.
+- **Parse time:** the ```` ```mermaid ```` fence is laid out on TextView's background parse. Layout takes well under a millisecond per diagram, so the size is known before drawing and nothing jumps. Empty or unreadable diagrams and unknown types return `None` and stay as code blocks. Renderer panics are caught.
+- **Draw time:** an SVG is rendered in the page's colors (background, foreground, border and the theme's accent), cached by diagram, colors and resolution, and rasterized by GPUI off the main thread. A theme change re-renders it, which is cheap.
+- **Sizing:** natural size scales with the reading size, shrinks to fit the page down to 75%, then scrolls sideways. The SVG's root size is raised for Retina sharpness within a pixel budget.
+- **Interaction:** hover shows Copy (source to clipboard) and Code/Diagram (flip to the source). The node's text is the source, so Find, copy and Source mode keep working.
+- **Known gaps:** monospace labels, layouts that differ from mermaid.js, and some syntax gaps (e.g. mind map `id((text))` roots). The renderer is lenient, so a partly malformed diagram may draw what it could read. Quick Look still shows code.
 
 ## 5. Dependencies and tools
 
@@ -121,7 +124,7 @@ Start with flowchart and sequence coverage. Keep strict mode, block external res
 | YAML parser, e.g. `serde_yaml_ng` | Properties | Confirm maintenance; Kit parser may cover some needs |
 | `nucleo-matcher` | Fuzzy filenames | Add only if Kit picker does not provide matching |
 | `markdown` | AST/ranges if needed | Glim uses 1.0.0; not mandatory alongside Kit |
-| Mermaid + bundler | Offline diagrams | Build-time JS assets only |
+| `rusty-mermaid` | Offline diagrams | Pure Rust, SVG backend only |
 | WebKit bridge (`wry` or small Swift helper) | Diagram helper | Glim uses wry; reuse proven path after spike |
 | `resvg` | SVG-to-image for diagrams | Follow Glim if adopting its diagram pipeline |
 | Swift/AppKit bridge | Association APIs, optional Quick Look | Small macOS-only boundary |
@@ -211,7 +214,7 @@ Exit: installed app handles cold and warm Finder opens and `.md` defaults correc
 
 ### Phase 4 — Mermaid
 
-Adapt the isolated renderer pattern, bundle engine assets/licenses, add cancellable cache and source fallback. Measure first-diagram latency separately from first-text paint.
+Done with a pure-Rust renderer (see "Mermaid: native, pure Rust"). `fixtures/Mermaid.md` covers ten diagram types plus the code fallbacks.
 
 Exit: flowchart and sequence fixtures render offline in both themes; malformed/large diagrams do not stall the reader; no Node installation is required.
 

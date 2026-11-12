@@ -223,6 +223,7 @@ pub fn extensions() -> MarkdownExtensions {
         MarkdownExtensions::default()
             .plugin(BlockMath)
             .plugin(InlineMath)
+            .plugin(crate::mermaid::plugin())
     });
     EXTENSIONS.clone()
 }

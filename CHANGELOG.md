@@ -7,6 +7,7 @@ All notable changes to Markdown Viewer are documented here. The format follows [
 Planned for 0.2.0.
 
 ### Added
+- **Mermaid diagrams.** ```` ```mermaid ```` blocks are drawn as diagrams, natively and offline (pure Rust, via rusty-mermaid), in colors taken from the page and the theme's accent. Flowcharts, sequence, state, class, ER, Gantt, pie, mind maps, Git graphs and more are supported. Diagrams scale with the text size, shrink to fit a narrow page and then scroll sideways. Hover one to copy its source or flip it to the code. A block that can't be drawn stays as code.
 - **Math.** LaTeX between `$…$` in a sentence, and `$$ … $$` or ```` ```math ```` blocks, is typeset natively (pure Rust, STIX Two Math) in the text color. Anything that doesn't typeset stays exactly as written, and dollar amounts like "$5 and $10" are left alone.
 - **Search in Files.** ⇧⌘F searches the text of every Markdown file in your open folders. Each result shows the line with the match highlighted, its file, the heading above it and the line number. ↵ opens the file with Find already on that match; ⌘↵ and ⌥↵ open it in a new tab or beside the current one.
 - **Update check.** Now and then the app asks GitHub for the latest release, and a button in the status bar says when a newer one is out (it opens the release page). Nothing is downloaded or sent. "Check for Updates…" and "Check for Updates Automatically" are in the Markdown Viewer menu.
