@@ -3712,6 +3712,11 @@ impl Reader {
                     cx.notify();
                 }),
                 "source" => self.with_pane(cx, |p, cx| p.toggle_source(cx)),
+                "scroll" => {
+                    let distance = px(arg.parse().unwrap_or(0.));
+                    self.with_pane(cx, |p, cx| p.text.read(cx).list_state().scroll_by(distance))
+                }
+                "mermaid-code" => crate::mermaid::show_all_source(true),
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(Picker::Files, window, cx),
                 "search" => {
@@ -4012,6 +4017,47 @@ mod tests {
         assert_eq!(pane(&view, cx, |p| p.match_index), 1);
         interact(w, cx, |w, cx| w.press("escape", cx));
         assert!(!pane(&view, cx, |p| p.find));
+    }
+
+    #[gpui_kit::test]
+    fn mermaid_draws_a_diagram_that_flips_to_its_source(cx: &mut TestAppContext) {
+        let (w, view) = open(cx);
+        let source = "flowchart LR\n  reader[Reader] -->|opens| doc[Document]";
+        view.update(cx, |v, cx| {
+            v.with_pane(cx, |p, cx| {
+                p.document = Some(Document::parse(format!(
+                    "# Diagram\n\n```mermaid\n{source}\n```\n\n```mermaid\nnot a diagram\n```\n"
+                )));
+                p.present(cx);
+            })
+        });
+        cx.run_until_parked();
+        let found = |w: WindowHandle<Root>, cx: &mut TestAppContext, id: &'static str| {
+            cx.update_window(w.into(), |_, w, cx| {
+                w.render_frame(cx);
+                w.find_all(id).len()
+            })
+            .unwrap()
+        };
+        // Only the block that is a diagram gets the diagram's buttons.
+        assert_eq!(found(w, cx, "mermaid-toggle"), 1);
+        interact(w, cx, |w, cx| w.click("mermaid-copy", cx));
+        assert_eq!(
+            cx.update(|cx| cx.read_from_clipboard())
+                .and_then(|c| c.text())
+                .as_deref(),
+            Some(source)
+        );
+        assert!(!crate::mermaid::showing_source_of(source));
+        interact(w, cx, |w, cx| w.click("mermaid-toggle", cx));
+        assert!(crate::mermaid::showing_source_of(source));
+        assert_eq!(
+            found(w, cx, "mermaid-toggle"),
+            1,
+            "the toggle stays to flip back"
+        );
+        interact(w, cx, |w, cx| w.click("mermaid-toggle", cx));
+        assert!(!crate::mermaid::showing_source_of(source));
     }
 
     #[test]

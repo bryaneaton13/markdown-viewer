@@ -4,6 +4,7 @@ mod files;
 mod info;
 mod logging;
 mod math;
+mod mermaid;
 mod names;
 mod pane;
 mod pet;

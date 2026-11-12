@@ -28,6 +28,7 @@ Open a folder of Markdown, jump between files, and read them rendered. Nothing i
 - Find against the *rendered* text, with match highlighting and next/previous.
 - **Search in Files** (⇧⌘F) across every Markdown file in your open folders, opening at the match.
 - **LaTeX math**: `$…$` inline, and `$$…$$` or ```` ```math ```` blocks, typeset natively. Anything that doesn't typeset stays as written.
+- **Mermaid diagrams**: ```` ```mermaid ```` blocks (flowcharts, sequence, state, class, ER, Gantt, pie, mind maps, Git graphs and more) are drawn natively in the page's theme. Hover a diagram to copy its source or flip to the code. Anything that can't be drawn stays as code.
 - Source view, YAML frontmatter shown in a collapsible Properties panel, and a heading outline.
 - **Workspaces** for several folders, listed together in the sidebar as folders that open and close, with **tabs** that can mix files from any of them, and a **side-by-side split** of two documents (⌘\\). Drag to reorder workspaces or sort them by name or recent use.
 - Editor-style **preview tabs**: a click previews a file in a reused italic tab, a double-click keeps it. Same-named files show the folder that tells them apart.
@@ -139,7 +140,7 @@ Each launch writes a log to `~/Library/Logs/Markdown Viewer` (the previous launc
 ## Limitations
 
 - At most two documents side by side per tab. No editing. Themes are a few built-in ones for the chrome, not custom.
-- Mermaid blocks render as code. Remote images are never fetched.
+- Mermaid is drawn by [rusty-mermaid](https://github.com/base58ed/rusty-mermaid), a pure-Rust renderer: labels are monospace, layouts can differ from mermaid.js, and some syntax (such as a mind map root written `id((text))`) isn't supported. Quick Look shows Mermaid as code. Remote images are never fetched.
 - Files must be UTF-8 and at most 8 MiB.
 - Folder discovery respects ignore rules, skips hidden files, does not follow directory symlinks, and stops at 20,000 files or 32 levels deep.
 - Quick Look shows images as alt text (the sandbox only receives the selected file), omits raw HTML, and blocks scripts and network access.

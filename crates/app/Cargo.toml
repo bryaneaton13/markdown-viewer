@@ -18,6 +18,7 @@ url = "2"
 ignore = "0.4"
 notify = "8"
 latex-rust = "3.0.1"
+rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
 log = "0.4"
 dirs = "6"
 

@@ -2,7 +2,7 @@
 # Real Metal pixels; isolated settings and no screen-recording permissions.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
-out=${1:?usage: scripts/shot.sh OUT.png [FILE_OR_FOLDER] [dark,properties,nosidebar,source,outline,quick-open,find:query,help]}
+out=${1:?usage: scripts/shot.sh OUT.png [FILE_OR_FOLDER] [dark,properties,nosidebar,source,outline,quick-open,find:query,scroll:px,help]}
 file=${2:-"$root/fixtures/Welcome.md"}
 actions=${3:-}
 cd "$root"
