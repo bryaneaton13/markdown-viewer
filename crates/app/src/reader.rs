@@ -4,7 +4,7 @@
 //! The sidebar lists every workspace as a folder that opens and closes
 //! (layout in `sidebar.rs`). Tabs belong to the window and can mix files
 //! from any workspace; the active workspace follows the focused document
-//! and scopes Quick Open.
+//! and comes first in Quick Open.
 
 use crate::{
     actions::*,
@@ -867,6 +867,49 @@ impl Reader {
         self.settle(window, cx);
     }
 
+    /// Close the panes showing any of `paths` (⇧⌘T brings them back).
+    /// Pinned tabs stay unless `pinned` is set.
+    fn close_files(
+        &mut self,
+        paths: &HashSet<PathBuf>,
+        pinned: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let close: HashSet<_> = self
+            .tabs
+            .tabs
+            .iter()
+            .filter(|t| pinned || !t.pinned)
+            .flat_map(|t| t.panes())
+            .filter(|p| p.read(cx).path.as_ref().is_some_and(|p| paths.contains(p)))
+            .map(|p| p.entity_id())
+            .collect();
+        if close.is_empty() {
+            return;
+        }
+        let blank = Self::make_pane(None, window, cx);
+        self.tabs
+            .close_panes(|p| close.contains(&p.entity_id()), || blank);
+        self.after_tab_change(window, cx);
+    }
+
+    /// "Close Files Below": close the loose files listed after `path`.
+    fn close_files_below(
+        &mut self,
+        ws: usize,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = &self.workspaces[ws].rows;
+        let Some(at) = rows.iter().position(|r| r.path == path) else {
+            return;
+        };
+        let below = rows[at + 1..].iter().map(|r| r.path.clone()).collect();
+        self.close_files(&below, false, window, cx);
+    }
+
     fn after_workspace_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
         self.drop_zone = None;
@@ -959,15 +1002,17 @@ impl Reader {
         cx.notify();
     }
 
-    /// "Open Files" lists the open documents outside every folder, and is
-    /// added back when one opens.
+    /// "Open Files" lists the open documents outside every folder, most
+    /// recently opened first, and is added back when one opens.
     fn refresh_loose(&mut self, cx: &App) {
-        let paths: Vec<PathBuf> = self
+        let open: Vec<PathBuf> = self
             .tabs
             .panes()
             .filter_map(|p| p.read(cx).path.clone())
             .filter(|p| !self.workspaces.iter().any(|w| w.contains(p)))
             .collect();
+        let paths = newest_first(&self.prefs.loose_order, open);
+        self.prefs.loose_order = paths.clone();
         match self.workspaces.iter_mut().find(|w| w.root.is_none()) {
             Some(ws) => ws.set_loose_rows(paths),
             None if !paths.is_empty() => {
@@ -1463,6 +1508,9 @@ impl Reader {
 
     fn open_picker(&mut self, kind: Picker, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = Some(kind);
+        if kind != Picker::Headings {
+            self.scan_unscanned(cx);
+        }
         // Search in Files reopens on its last query and results.
         let query = if kind == Picker::Text {
             self.search.query.clone()
@@ -1474,6 +1522,67 @@ impl Reader {
             s.focus(window, cx);
         });
         cx.notify();
+    }
+
+    /// Quick Open's files, with their labels: every workspace's, the active
+    /// one first and then in sidebar order, each file once. Folder files are
+    /// named by their path inside the folder (led by its name when several
+    /// folders are open); open files outside every folder as the sidebar
+    /// names them.
+    fn quick_open_files(&self) -> Vec<(PathBuf, String)> {
+        let folders = self.workspaces.iter().filter(|w| w.root.is_some()).count();
+        let mut order = self.order();
+        order.retain(|&ix| ix != self.active);
+        order.insert(0, self.active);
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        for ix in order {
+            let ws = &self.workspaces[ix];
+            match &ws.root {
+                Some(root) => {
+                    for path in &ws.files {
+                        if !seen.insert(path.clone()) {
+                            continue;
+                        }
+                        let rel = path.strip_prefix(root).unwrap_or(path).display();
+                        let label = if folders > 1 {
+                            format!("{} / {rel}", ws.name())
+                        } else {
+                            rel.to_string()
+                        };
+                        items.push((path.clone(), label));
+                    }
+                }
+                None => {
+                    // Named as in the sidebar: the file, then its folder.
+                    let paths: Vec<&Path> = ws.rows.iter().map(|r| r.path.as_path()).collect();
+                    let hints = names::disambiguate(&paths, true);
+                    for (row, hint) in ws.rows.iter().zip(hints) {
+                        if !seen.insert(row.path.clone()) {
+                            continue;
+                        }
+                        let name = row.path.file_name().unwrap_or_default().to_string_lossy();
+                        let label = match hint {
+                            Some(hint) => format!("{} / {name} · {hint}", ws.name()),
+                            None => format!("{} / {name}", ws.name()),
+                        };
+                        items.push((row.path.clone(), label));
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    /// Scan the folder workspaces not read yet (closed in the sidebar since
+    /// launch), so Quick Open and Search in Files cover every workspace.
+    fn scan_unscanned(&mut self, cx: &mut Context<Self>) {
+        for ix in 0..self.workspaces.len() {
+            let ws = &self.workspaces[ix];
+            if ws.root.is_some() && !ws.scanned && !ws.indexing {
+                self.scan(ix, cx);
+            }
+        }
     }
 
     /// Every Markdown file Search in Files reads: the scanned workspaces'
@@ -1612,7 +1721,8 @@ impl Reader {
             }
             Some(Picker::Files) => {
                 let row = self.palette.read(cx).selected_index().map(|ix| ix.row);
-                let path = row.and_then(|r| self.ws().files.get(r).cloned());
+                let path =
+                    row.and_then(|r| self.quick_open_files().into_iter().nth(r).map(|(p, _)| p));
                 self.close_overlay(window, cx);
                 path
             }
@@ -2513,6 +2623,9 @@ impl Reader {
                     })
                     .flatten();
                 let (menu_weak, menu_path) = (cx.entity().downgrade(), entry.path.clone());
+                // Open Files rows are open documents, which can be closed here.
+                let loose = self.workspaces[ws].root.is_none();
+                let last = row_ix + 1 >= self.workspaces[ws].rows.len();
                 let selected = current.as_ref() == Some(&entry.path);
                 let directory = entry.directory;
                 let icon = if !directory {
@@ -2595,6 +2708,33 @@ impl Reader {
                         d.on_drag(payload, move |_, _, _, cx| cx.new(|_| Ghost(name.clone())))
                     })
                     .context_menu(move |menu, _, _| {
+                        let menu = if loose {
+                            let item = |label: &'static str,
+                                        f: fn(
+                                &mut Reader,
+                                usize,
+                                &Path,
+                                &mut Window,
+                                &mut Context<Reader>,
+                            )| {
+                                let (weak, path) = (menu_weak.clone(), menu_path.clone());
+                                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                    let _ = weak.update(cx, |v, cx| f(v, ws, &path, window, cx));
+                                })
+                            };
+                            menu.item(item("Close Tab", |v, _, p, w, cx| {
+                                v.close_files(&HashSet::from([p.to_owned()]), true, w, cx)
+                            }))
+                            .item(
+                                item("Close Files Below", |v, ws, p, w, cx| {
+                                    v.close_files_below(ws, p, w, cx)
+                                })
+                                .disabled(last),
+                            )
+                            .separator()
+                        } else {
+                            menu
+                        };
                         Self::file_menu_items(
                             menu,
                             menu_path.clone(),
@@ -3487,7 +3627,6 @@ impl Reader {
     fn picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let kind = self.picker.unwrap_or(Picker::Files);
         let outline = kind == Picker::Headings;
-        let ws = self.ws();
         let items: Vec<CommandItem> = match kind {
             Picker::Headings => self
                 .focused_pane()
@@ -3511,18 +3650,13 @@ impl Reader {
                         .collect()
                 })
                 .unwrap_or_default(),
-            Picker::Files => ws
-                .files
-                .iter()
-                .map(|path| {
+            Picker::Files => self
+                .quick_open_files()
+                .into_iter()
+                .map(|(path, label)| {
                     CommandItem::new()
-                        .label(
-                            path.strip_prefix(ws.root.as_deref().unwrap_or(Path::new("/")))
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
-                        .action(Box::new(OpenPath { path: path.clone() }))
+                        .label(label)
+                        .action(Box::new(OpenPath { path }))
                 })
                 .collect(),
             Picker::Text => {
@@ -3544,7 +3678,10 @@ impl Reader {
         };
         let empty_msg: SharedString = match kind {
             Picker::Headings => "No headings in this document.".into(),
-            Picker::Files if ws.root.is_none() => {
+            Picker::Files if self.workspaces.iter().any(|w| w.indexing) => {
+                "Finding Markdown files…".into()
+            }
+            Picker::Files if self.workspaces.iter().all(|w| w.root.is_none()) => {
                 "Add a folder (⇧⌘O) to search its Markdown files.".into()
             }
             Picker::Files => "No matching files.".into(),
@@ -3719,6 +3856,14 @@ impl Reader {
                 "mermaid-code" => crate::mermaid::show_all_source(true),
                 "help" => self.with_pane(cx, |p, cx| p.toggle_help(cx)),
                 "quick-open" => self.open_picker(Picker::Files, window, cx),
+                "close-file" => {
+                    self.close_files(&HashSet::from([PathBuf::from(arg)]), true, window, cx)
+                }
+                "close-below" => {
+                    if let Some(ws) = self.workspaces.iter().position(|w| w.root.is_none()) {
+                        self.close_files_below(ws, Path::new(arg), window, cx);
+                    }
+                }
                 "search" => {
                     self.open_picker(Picker::Text, window, cx);
                     self.palette
@@ -3901,6 +4046,24 @@ impl Render for Reader {
                     .when(self.picker.is_some(), |d| d.child(self.picker(cx))),
             )
     }
+}
+
+/// Order the open loose files: those already listed keep their place, and
+/// newly opened ones go on top (in tab order). Closed ones drop out, so a
+/// file opened again comes back on top.
+fn newest_first(listed: &[PathBuf], open: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let open: Vec<PathBuf> = open
+        .into_iter()
+        .filter(|p| seen.insert(p.clone()))
+        .collect();
+    let mut paths: Vec<PathBuf> = open
+        .iter()
+        .filter(|p| !listed.contains(p))
+        .cloned()
+        .collect();
+    paths.extend(listed.iter().filter(|p| seen.contains(*p)).cloned());
+    paths
 }
 
 #[cfg(test)]
@@ -4198,6 +4361,40 @@ mod tests {
         interact(w, cx, |w, cx| w.press("enter", cx));
         assert_eq!(pane(&view, cx, |p| p.path.clone()), Some(second));
         assert!(view.read_with(cx, |v, _| v.picker.is_none()));
+    }
+
+    #[gpui_kit::test]
+    fn quick_open_searches_every_workspace(cx: &mut TestAppContext) {
+        let one = folder(&[("One.md", "# One")]);
+        let two = folder(&[("Two.md", "# Two")]);
+        let loose = folder(&[("Loose.md", "# Loose")]);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.add_folder(one.path().into(), w, cx);
+            v.add_folder(two.path().into(), w, cx);
+            v.open_in(loose.path().join("Loose.md"), Target::Focused, w, cx);
+        });
+        cx.run_until_parked();
+        // The loose file's "Open Files" is active, yet both folders show.
+        let (active_root, paths) = view.read_with(cx, |v, _| {
+            let paths: Vec<PathBuf> = v.quick_open_files().into_iter().map(|(p, _)| p).collect();
+            (v.ws().root.clone(), paths)
+        });
+        assert_eq!(active_root, None);
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert_eq!(paths[0], loose.path().join("Loose.md"));
+        assert!(paths.contains(&one.path().join("One.md")));
+        assert!(paths.contains(&two.path().join("Two.md")));
+        interact(w, cx, |w, cx| {
+            w.press("cmd-p", cx);
+            w.render_frame(cx);
+            w.input("One", cx);
+        });
+        interact(w, cx, |w, cx| w.press("cmd-enter", cx));
+        assert_eq!(
+            pane(&view, cx, |p| p.path.clone()),
+            Some(one.path().join("One.md"))
+        );
     }
 
     #[gpui_kit::test]
@@ -4542,8 +4739,9 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
-        assert_eq!(names, ["Open Files", "A.md", "B.md"]);
-        // Clicking an open document goes to its tab.
+        // The most recently opened is on top.
+        assert_eq!(names, ["Open Files", "B.md", "A.md"]);
+        // Clicking an open document goes to its tab, without reordering.
         with_reader(w, &view, cx, |v, w, cx| {
             v.open_from_tree(v.active, tmp.path().join("A.md"), Target::Preview, w, cx)
         });
@@ -4551,6 +4749,68 @@ mod tests {
             view.read_with(cx, |v, _| (v.tabs.len(), v.tabs.active)),
             (2, 0)
         );
+        let loose = |v: &Reader| -> Vec<PathBuf> {
+            let ws = v.workspaces.iter().find(|w| w.root.is_none()).unwrap();
+            ws.rows.iter().map(|r| r.path.clone()).collect()
+        };
+        assert_eq!(
+            view.read_with(cx, |v, _| loose(v)),
+            [tmp.path().join("B.md"), tmp.path().join("A.md")]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn loose_files_close_from_the_sidebar(cx: &mut TestAppContext) {
+        let tmp = folder(&[
+            ("A.md", "# A"),
+            ("B.md", "# B"),
+            ("C.md", "# C"),
+            ("D.md", "# D"),
+        ]);
+        let p = |n: &str| tmp.path().join(n);
+        let (w, view) = open(cx);
+        with_reader(w, &view, cx, |v, w, cx| {
+            for n in ["A.md", "B.md", "C.md", "D.md"] {
+                v.open_path(p(n), w, cx);
+            }
+        });
+        let loose = |v: &Reader| -> Vec<PathBuf> {
+            let ws = v.workspaces.iter().find(|w| w.root.is_none()).unwrap();
+            ws.rows.iter().map(|r| r.path.clone()).collect()
+        };
+        assert_eq!(
+            view.read_with(cx, |v, _| loose(v)),
+            [p("D.md"), p("C.md"), p("B.md"), p("A.md")]
+        );
+        // Close Tab closes that file only.
+        with_reader(w, &view, cx, |v, w, cx| {
+            v.close_files(&HashSet::from([p("C.md")]), true, w, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |v, _| loose(v)),
+            [p("D.md"), p("B.md"), p("A.md")]
+        );
+        // Close Files Below keeps the clicked one and those above it.
+        with_reader(w, &view, cx, |v, w, cx| {
+            let ws = v.workspaces.iter().position(|w| w.root.is_none()).unwrap();
+            v.close_files_below(ws, &p("D.md"), w, cx)
+        });
+        assert_eq!(view.read_with(cx, |v, _| loose(v)), [p("D.md")]);
+        assert_eq!(view.read_with(cx, |v, _| v.tabs.len()), 1);
+        // A closed file opened again goes back on top.
+        with_reader(w, &view, cx, |v, w, cx| v.open_path(p("A.md"), w, cx));
+        assert_eq!(view.read_with(cx, |v, _| loose(v)), [p("A.md"), p("D.md")]);
+    }
+
+    #[test]
+    fn newest_first_keeps_places_and_puts_new_files_on_top() {
+        let p = |n: &str| PathBuf::from(format!("/x/{n}"));
+        let listed = [p("b"), p("a"), p("gone")];
+        assert_eq!(
+            newest_first(&listed, vec![p("a"), p("b"), p("c"), p("d"), p("a")]),
+            [p("c"), p("d"), p("b"), p("a")]
+        );
+        assert!(newest_first(&listed, vec![]).is_empty());
     }
 
     #[gpui_kit::test]
