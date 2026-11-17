@@ -10,21 +10,21 @@ description = "A read-only, native macOS Markdown reader built with GPUI"
 
 [dependencies]
 markdown-core = { path = "../markdown-core" }
-gpui-kit = { version = "=0.9.0", features = ["tree-sitter-rust", "tree-sitter-yaml", "tree-sitter-markdown"] }
+gpui-kit = { version = "=0.10.0", features = ["tree-sitter-rust", "tree-sitter-yaml", "tree-sitter-markdown"] }
 async-channel = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
 ignore = "0.4"
 notify = "8"
-latex-rust = "3.0.1"
+latex-rust = "3.0.3"
 rusty-mermaid = { version = "=0.2.0", features = ["svg"] }
 log = "0.4"
-dirs = "6"
+dirs = "7"
 
 [features]
 screenshot = ["gpui-kit/test-support"]
 
 [dev-dependencies]
-gpui-kit = { version = "=0.9.0", features = ["test-support"] }
+gpui-kit = { version = "=0.10.0", features = ["test-support"] }
 tempfile = "3"
