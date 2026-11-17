@@ -27,6 +27,10 @@ pub struct Preferences {
     /// settings written before 0.2, which therefore count as an update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_version: Option<String>,
+    /// The open files outside every folder, most recently opened first:
+    /// the order "Open Files" lists them in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub loose_order: Vec<PathBuf>,
     /// No settings file existed: a first launch, which has nothing "new".
     #[serde(skip)]
     pub first_launch: bool,
@@ -108,6 +112,7 @@ impl Default for Preferences {
             sidebar_sort: Sort::Manual,
             check_updates: true,
             last_seen_version: None,
+            loose_order: Vec::new(),
             first_launch: false,
             folder: None,
             file: None,
